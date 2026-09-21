@@ -2,8 +2,6 @@
 
 import { FormEvent, useState } from 'react';
 
-const API_URL = (process.env.NEXT_PUBLIC_API_URL || 'https://nisaan-searchengine-api.onrender.com').replace(/\/$/, '');
-
 type Result = { id:number; url:string; title?:string; description?:string; content?:string; domain?:string };
 
 export default function Home() {
@@ -20,9 +18,11 @@ export default function Home() {
     const q=query.trim(); if(!q) return;
     setLoading(true); setSearched(true); setPage(nextPage); setError('');
     try {
-      const res=await fetch(`${API_URL}/search?q=${encodeURIComponent(q)}&limit=10&offset=${nextPage*10}`, { cache: 'no-store' });
-      if(!res.ok) throw new Error(`API returned ${res.status}`);
-      const data=await res.json(); setResults(data.results||[]); setTotal(data.total||0);
+      const res=await fetch(`/api/search?q=${encodeURIComponent(q)}&limit=10&offset=${nextPage*10}`, { cache: 'no-store' });
+      const data=await res.json().catch(()=>({}));
+      if(!res.ok) throw new Error(data.detail || `Search API returned ${res.status}`);
+      setResults(Array.isArray(data.results) ? data.results : []);
+      setTotal(Number(data.total) || 0);
     } catch (err) {
       setResults([]); setTotal(0);
       setError(err instanceof Error ? err.message : 'Unable to reach search API');
