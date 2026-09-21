@@ -1,6 +1,6 @@
 # NisaanSearchEngine crawler
 
-The V1 crawler is intentionally conservative. It:
+The V1 crawler is intentionally controlled. It:
 
 - only follows HTTP(S) URLs;
 - removes fragments and normalizes URLs;
@@ -23,4 +23,14 @@ pip install -r requirements.txt
 python crawler.py https://example.com --max-pages 5 --max-depth 1
 ```
 
-Database persistence and the search index are the next stages. Do not point this crawler at unrestricted large-scale crawling jobs yet.
+## Persist pages
+
+Set the server-side `DATABASE_URL`, then run:
+
+```bash
+python run_crawl.py https://example.com --max-pages 10 --max-depth 1
+```
+
+This upserts crawled HTML documents into the PostgreSQL/Supabase `pages` table. Never commit database credentials.
+
+The next stage is synchronizing these documents into the search index.
