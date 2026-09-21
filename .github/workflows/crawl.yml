@@ -1,0 +1,17 @@
+name: Crawl NisaanSearchEngine index
+
+on:
+  schedule:
+    - cron: '17 * * * *'
+  workflow_dispatch:
+
+jobs:
+  crawl:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger controlled crawler
+        run: |
+          set -e
+          curl --fail --show-error --silent \
+            --max-time 90 \
+            'https://nisaan-searchengine-api.onrender.com/crawl?max_pages=10'
