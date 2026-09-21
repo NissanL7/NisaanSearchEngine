@@ -1,17 +1,25 @@
 """NisaanSearchEngine V1 HTTP API."""
 from __future__ import annotations
 
+import os
+
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
-from search_index.indexer import search
+from .search_index import search
+
+origins = [
+    origin.strip()
+    for origin in os.getenv("API_CORS_ORIGINS", "http://localhost:3000").split(",")
+    if origin.strip()
+]
 
 app = FastAPI(title="NisaanSearchEngine API", version="0.1.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
-    allow_credentials=True,
+    allow_origins=origins,
+    allow_credentials=False,
     allow_methods=["GET"],
     allow_headers=["*"],
 )
