@@ -5,7 +5,7 @@ import os
 import re
 from difflib import SequenceMatcher
 from typing import Any
-from urllib.parse import parse_qs, unquote, urlencode, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 import httpx
 import psycopg
@@ -19,9 +19,21 @@ SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
 SUPABASE_KEY = os.getenv("SUPABASE_PUBLISHABLE_KEY", "")
 BRAVE_API_KEY = os.getenv("BRAVE_SEARCH_API_KEY", "")
 
+# Words that carry little topical meaning in a normal web query.
+_STOPWORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "by", "do", "does", "for", "from",
+    "how", "i", "in", "is", "it", "me", "of", "on", "or", "the", "this", "to", "was",
+    "what", "when", "where", "which", "who", "why", "with", "you", "your", "can", "could",
+    "would", "should", "about", "into", "than", "that", "these", "those", "tell", "give",
+}
+
 
 def _tokens(text: str) -> list[str]:
     return re.findall(r"[\w\u0900-\u097F]+", text.lower(), flags=re.UNICODE)
+
+
+def _topic_tokens(query: str) -> list[str]:
+    return [t for t in dict.fromkeys(_tokens(query)) if t not in _STOPWORDS and len(t) > 1]
 
 
 def _meili_search(query: str, limit: int, offset: int) -> dict[str, Any]:
@@ -188,21 +200,83 @@ def _bing_search(query: str, limit: int, offset: int) -> dict[str, Any]:
     return {"estimatedTotalHits": len(hits), "hits": hits}
 
 
+def _hit_topic_overlap(hit: dict[str, Any], query: str) -> tuple[int, int]:
+    """Return (strong_matches, total_matches) for meaningful query terms."""
+    topics = _topic_tokens(query)
+    title = str(hit.get("title") or "").lower()
+    description = str(hit.get("description") or "").lower()
+    content = str(hit.get("content") or "").lower()
+    domain = str(hit.get("domain") or "").lower()
+    title_tokens = set(_tokens(title))
+    desc_tokens = set(_tokens(description))
+    content_tokens = set(_tokens(content))
+    domain_tokens = set(_tokens(domain))
+    strong = 0
+    total = 0
+    for token in topics:
+        in_title = token in title_tokens or token in title
+        in_desc = token in desc_tokens or token in description
+        in_domain = token in domain_tokens or token in domain
+        in_content = token in content_tokens or token in content
+        if in_title or in_desc or in_domain:
+            strong += 1
+        if in_title or in_desc or in_domain or in_content:
+            total += 1
+    return strong, total
+
+
+def _relevant_web_hits(hits: list[dict[str, Any]], query: str) -> list[dict[str, Any]]:
+    """Remove unrelated provider results before ranking/merging them."""
+    topics = _topic_tokens(query)
+    if not topics:
+        return hits
+    relevant = []
+    for hit in hits:
+        strong, total = _hit_topic_overlap(hit, query)
+        # One-word query: the exact topic must appear in title/description/domain/content.
+        if len(topics) == 1 and total >= 1:
+            relevant.append(hit)
+        # Sentence/question: require at least one strong topic match, and two matches
+        # when the query contains multiple substantive terms.
+        elif len(topics) >= 2 and strong >= 1 and total >= 1:
+            relevant.append(hit)
+    return relevant
+
+
 def _web_search(query: str, limit: int, offset: int) -> dict[str, Any]:
+    """Query multiple public providers instead of trusting the first provider's results."""
     providers = []
     if BRAVE_API_KEY:
-        providers.append(lambda: _brave_search(query, limit, offset))
-    providers.extend([lambda: _ddg_search(query, limit, offset, lite=False), lambda: _bing_search(query, limit, offset), lambda: _ddg_search(query, limit, offset, lite=True)])
-    errors = []
-    for provider in providers:
+        providers.append(("brave", lambda: _brave_search(query, limit, offset)))
+    providers.extend([
+        ("bing", lambda: _bing_search(query, limit, offset)),
+        ("duckduckgo", lambda: _ddg_search(query, limit, offset, lite=False)),
+        ("duckduckgo-lite", lambda: _ddg_search(query, limit, offset, lite=True)),
+    ])
+    all_hits: list[dict[str, Any]] = []
+    errors: list[str] = []
+    provider_hits: dict[str, int] = {}
+    for name, provider in providers:
         try:
             result = provider()
-            if result.get("hits"):
-                result["provider_errors"] = errors
-                return result
+            hits = result.get("hits", []) or []
+            relevant = _relevant_web_hits(hits, query)
+            provider_hits[name] = len(relevant)
+            all_hits.extend(relevant)
         except Exception as exc:
-            errors.append(type(exc).__name__)
-    return {"estimatedTotalHits": 0, "hits": [], "provider_errors": errors}
+            errors.append(f"{name}:{type(exc).__name__}")
+
+    # Deduplicate only after collecting providers, so a bad first provider cannot
+    # prevent a better provider from being used.
+    merged = _merge_hits(all_hits, [], max(limit + offset, 30))
+    ranked = _rank_hits(merged, query)
+    page = ranked[offset : offset + limit]
+    return {
+        "estimatedTotalHits": len(ranked),
+        "hits": page,
+        "provider_errors": errors,
+        "provider_hits": provider_hits,
+    }
 
 
 def _score_hit(hit: dict[str, Any], query: str) -> float:
@@ -244,16 +318,14 @@ def _rank_hits(hits: list[dict[str, Any]], query: str) -> list[dict[str, Any]]:
 
 
 def _filter_relevant_local(hits: list[dict[str, Any]], query: str) -> list[dict[str, Any]]:
-    """Reject weak local matches so common words such as 'is' cannot pollute web results."""
-    q_tokens = list(dict.fromkeys(_tokens(query)))
-    if not q_tokens:
+    """Reject weak local matches so common words cannot pollute web results."""
+    topics = _topic_tokens(query)
+    if not topics:
         return []
-    required = 1 if len(q_tokens) == 1 else 2
     filtered = []
     for hit in hits:
-        text = " ".join(str(hit.get(k) or "").lower() for k in ("title", "description", "content", "domain"))
-        text_tokens = set(_tokens(text))
-        if query.lower() in text or sum(token in text_tokens for token in q_tokens) >= required:
+        strong, total = _hit_topic_overlap(hit, query)
+        if (len(topics) == 1 and total >= 1) or (len(topics) >= 2 and strong >= 1 and total >= 1):
             filtered.append(hit)
     return filtered
 
@@ -291,4 +363,4 @@ def search(query: str, limit: int = 20, offset: int = 0) -> dict[str, Any]:
     ranked = _rank_hits(merged, query)
     page = ranked[offset : offset + limit]
     total = max(int(web.get("estimatedTotalHits", 0) or 0), int(local.get("estimatedTotalHits", 0) or 0), len(ranked))
-    return {"estimatedTotalHits": total, "hits": page, "source": "web+local" if web_hits and local_hits else ("web" if web_hits else "local" if local_hits else "none"), "provider_errors": web.get("provider_errors", [])}
+    return {"estimatedTotalHits": total, "hits": page, "source": "web+local" if web_hits and local_hits else ("web" if web_hits else "local" if local_hits else "none"), "provider_errors": web.get("provider_errors", []), "provider_hits": web.get("provider_hits", {})}
