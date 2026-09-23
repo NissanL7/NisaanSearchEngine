@@ -31,11 +31,7 @@ def _meili_search(query: str, limit: int, offset: int) -> dict[str, Any]:
     if MEILI_KEY:
         headers["Authorization"] = f"Bearer {MEILI_KEY}"
     with httpx.Client(timeout=8) as client:
-        r = client.post(
-            f"{MEILI_URL}/indexes/{INDEX_NAME}/search",
-            headers=headers,
-            json={"q": query, "limit": limit, "offset": offset},
-        )
+        r = client.post(f"{MEILI_URL}/indexes/{INDEX_NAME}/search", headers=headers, json={"q": query, "limit": limit, "offset": offset})
         r.raise_for_status()
         return r.json()
 
@@ -44,8 +40,7 @@ def _postgres_search(query: str, limit: int, offset: int) -> dict[str, Any]:
     fields = "id,url,title,description,content,domain,language,status_code,crawled_at,word_count"
     with psycopg.connect(DATABASE_URL, connect_timeout=5) as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                f"""
+            cur.execute(f"""
                 select {fields}, ts_rank_cd(
                     to_tsvector('english', coalesce(title,'') || ' ' || coalesce(description,'') || ' ' || coalesce(content,'')),
                     websearch_to_tsquery('english', %(query)s)
@@ -55,19 +50,14 @@ def _postgres_search(query: str, limit: int, offset: int) -> dict[str, Any]:
                     @@ websearch_to_tsquery('english', %(query)s)
                 order by text_rank desc, crawled_at desc nulls last
                 limit %(candidate_limit)s offset %(offset)s
-                """,
-                {"query": query, "candidate_limit": min(max(limit + offset, 30), 100), "offset": offset},
-            )
+                """, {"query": query, "candidate_limit": min(max(limit + offset, 30), 100), "offset": offset})
             columns = [d.name for d in cur.description]
             hits = [dict(zip(columns, row)) for row in cur.fetchall()]
-            cur.execute(
-                """
+            cur.execute("""
                 select count(*) from pages
                 where to_tsvector('english', coalesce(title,'') || ' ' || coalesce(description,'') || ' ' || coalesce(content,''))
                     @@ websearch_to_tsquery('english', %(query)s)
-                """,
-                {"query": query},
-            )
+                """, {"query": query})
             total = int(cur.fetchone()[0] or 0)
             if hits:
                 return {"estimatedTotalHits": total, "hits": hits}
@@ -81,10 +71,7 @@ def _postgres_search(query: str, limit: int, offset: int) -> dict[str, Any]:
             where = " or ".join(clauses) or "false"
             cur.execute(f"select count(*) from pages where {where}", params)
             fallback_total = int(cur.fetchone()[0] or 0)
-            cur.execute(
-                f"select {fields} from pages where {where} order by crawled_at desc nulls last limit %(limit)s offset %(offset)s",
-                {**params, "limit": limit, "offset": offset},
-            )
+            cur.execute(f"select {fields} from pages where {where} order by crawled_at desc nulls last limit %(limit)s offset %(offset)s", {**params, "limit": limit, "offset": offset})
             columns = [d.name for d in cur.description]
             fallback_hits = [dict(zip(columns, row)) for row in cur.fetchall()]
     return {"estimatedTotalHits": fallback_total, "hits": fallback_hits}
@@ -101,17 +88,8 @@ def _supabase_search(query: str, limit: int, offset: int) -> dict[str, Any]:
             safe = re.sub(r"[*,%()]", " ", term).strip()
             if not safe:
                 continue
-            params = {
-                "select": fields,
-                "or": f"(title.ilike.*{safe}*,description.ilike.*{safe}*,content.ilike.*{safe}*,domain.ilike.*{safe}*)",
-                "limit": str(min(max(limit + offset, 20), 100)),
-                "order": "crawled_at.desc",
-            }
-            r = client.get(
-                f"{SUPABASE_URL}/rest/v1/pages",
-                headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"},
-                params=params,
-            )
+            params = {"select": fields, "or": f"(title.ilike.*{safe}*,description.ilike.*{safe}*,content.ilike.*{safe}*,domain.ilike.*{safe}*)", "limit": str(min(max(limit + offset, 20), 100)), "order": "crawled_at.desc"}
+            r = client.get(f"{SUPABASE_URL}/rest/v1/pages", headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}"}, params=params)
             r.raise_for_status()
             for hit in r.json():
                 url = str(hit.get("url") or "")
@@ -122,7 +100,6 @@ def _supabase_search(query: str, limit: int, offset: int) -> dict[str, Any]:
 
 
 def _local_search(query: str, limit: int, offset: int) -> dict[str, Any]:
-    """Try every configured local index independently; one broken backend must not kill web search."""
     providers = []
     if MEILI_URL:
         providers.append(_meili_search)
@@ -144,26 +121,14 @@ def _brave_search(query: str, limit: int, offset: int) -> dict[str, Any]:
     if not BRAVE_API_KEY:
         return {"estimatedTotalHits": 0, "hits": []}
     with httpx.Client(timeout=8) as client:
-        r = client.get(
-            "https://api.search.brave.com/res/v1/web/search",
-            headers={"Accept": "application/json", "X-Subscription-Token": BRAVE_API_KEY},
-            params={"q": query, "count": min(max(limit, 1), 20), "offset": max(offset, 0), "safesearch": "moderate"},
-        )
+        r = client.get("https://api.search.brave.com/res/v1/web/search", headers={"Accept": "application/json", "X-Subscription-Token": BRAVE_API_KEY}, params={"q": query, "count": min(max(limit, 1), 20), "offset": max(offset, 0), "safesearch": "moderate"})
         r.raise_for_status()
         data = r.json()
     web = data.get("web", {})
     hits = []
     for i, item in enumerate(web.get("results", [])):
         url = item.get("url") or ""
-        hits.append({
-            "id": f"brave-{offset+i}-{abs(hash(url))}",
-            "url": url,
-            "title": item.get("title") or url,
-            "description": item.get("description") or "",
-            "content": item.get("description") or "",
-            "domain": item.get("profile", {}).get("long_name") or urlparse(url).netloc,
-            "source": "brave",
-        })
+        hits.append({"id": f"brave-{offset+i}-{abs(hash(url))}", "url": url, "title": item.get("title") or url, "description": item.get("description") or "", "content": item.get("description") or "", "domain": item.get("profile", {}).get("long_name") or urlparse(url).netloc, "source": "brave"})
     return {"estimatedTotalHits": int(web.get("totalEstimatedMatches") or len(hits)), "hits": hits}
 
 
@@ -177,14 +142,7 @@ def _unwrap_url(href: str) -> str:
 
 def _ddg_search(query: str, limit: int, offset: int, lite: bool = False) -> dict[str, Any]:
     endpoint = "https://lite.duckduckgo.com/lite/" if lite else "https://html.duckduckgo.com/html/"
-    with httpx.Client(
-        timeout=8,
-        follow_redirects=True,
-        headers={
-            "User-Agent": "Mozilla/5.0 (compatible; NisaanSearchEngine/1.0)",
-            "Accept-Language": "en-US,en;q=0.9",
-        },
-    ) as client:
+    with httpx.Client(timeout=8, follow_redirects=True, headers={"User-Agent": "Mozilla/5.0 (compatible; NisaanSearchEngine/1.0)", "Accept-Language": "en-US,en;q=0.9"}) as client:
         r = client.get(endpoint, params={"q": query})
         r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
@@ -201,29 +159,16 @@ def _ddg_search(query: str, limit: int, offset: int, lite: bool = False) -> dict
             continue
         parent = link.parent
         block = link.find_parent(class_=re.compile(r"result", re.I)) or parent
-        snippet_node = block.select_one(".result__snippet, .result-snippet, .result-snippet") if block else None
+        snippet_node = block.select_one(".result__snippet, .result-snippet") if block else None
         description = snippet_node.get_text(" ", strip=True) if snippet_node else ""
-        hits.append({
-            "id": f"ddg-{offset+i}-{abs(hash(url))}",
-            "url": url,
-            "title": link.get_text(" ", strip=True) or url,
-            "description": description,
-            "content": description,
-            "domain": urlparse(url).netloc,
-            "source": "duckduckgo",
-        })
+        hits.append({"id": f"ddg-{offset+i}-{abs(hash(url))}", "url": url, "title": link.get_text(" ", strip=True) or url, "description": description, "content": description, "domain": urlparse(url).netloc, "source": "duckduckgo"})
         if len(hits) >= min(max(limit + offset, 10), 20):
             break
     return {"estimatedTotalHits": len(hits), "hits": hits}
 
 
 def _bing_search(query: str, limit: int, offset: int) -> dict[str, Any]:
-    """Public Bing HTML fallback; no API key required."""
-    with httpx.Client(
-        timeout=8,
-        follow_redirects=True,
-        headers={"User-Agent": "Mozilla/5.0 (compatible; NisaanSearchEngine/1.0)", "Accept-Language": "en-US,en;q=0.9"},
-    ) as client:
+    with httpx.Client(timeout=8, follow_redirects=True, headers={"User-Agent": "Mozilla/5.0 (compatible; NisaanSearchEngine/1.0)", "Accept-Language": "en-US,en;q=0.9"}) as client:
         r = client.get("https://www.bing.com/search", params={"q": query, "count": min(max(limit + offset, 10), 20)})
         r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
@@ -237,30 +182,17 @@ def _bing_search(query: str, limit: int, offset: int) -> dict[str, Any]:
             continue
         p = item.select_one(".b_caption p, p")
         description = p.get_text(" ", strip=True) if p else ""
-        hits.append({
-            "id": f"bing-{offset+i}-{abs(hash(url))}",
-            "url": url,
-            "title": link.get_text(" ", strip=True) or url,
-            "description": description,
-            "content": description,
-            "domain": urlparse(url).netloc,
-            "source": "bing",
-        })
+        hits.append({"id": f"bing-{offset+i}-{abs(hash(url))}", "url": url, "title": link.get_text(" ", strip=True) or url, "description": description, "content": description, "domain": urlparse(url).netloc, "source": "bing"})
         if len(hits) >= min(max(limit + offset, 10), 20):
             break
     return {"estimatedTotalHits": len(hits), "hits": hits}
 
 
 def _web_search(query: str, limit: int, offset: int) -> dict[str, Any]:
-    """Broad-web search with several independent fallbacks."""
     providers = []
     if BRAVE_API_KEY:
         providers.append(lambda: _brave_search(query, limit, offset))
-    providers.extend([
-        lambda: _ddg_search(query, limit, offset, lite=False),
-        lambda: _bing_search(query, limit, offset),
-        lambda: _ddg_search(query, limit, offset, lite=True),
-    ])
+    providers.extend([lambda: _ddg_search(query, limit, offset, lite=False), lambda: _bing_search(query, limit, offset), lambda: _ddg_search(query, limit, offset, lite=True)])
     errors = []
     for provider in providers:
         try:
@@ -311,6 +243,21 @@ def _rank_hits(hits: list[dict[str, Any]], query: str) -> list[dict[str, Any]]:
     return [dict(hit, relevance=round(score, 3)) for hit, score in ranked]
 
 
+def _filter_relevant_local(hits: list[dict[str, Any]], query: str) -> list[dict[str, Any]]:
+    """Reject weak local matches so common words such as 'is' cannot pollute web results."""
+    q_tokens = list(dict.fromkeys(_tokens(query)))
+    if not q_tokens:
+        return []
+    required = 1 if len(q_tokens) == 1 else 2
+    filtered = []
+    for hit in hits:
+        text = " ".join(str(hit.get(k) or "").lower() for k in ("title", "description", "content", "domain"))
+        text_tokens = set(_tokens(text))
+        if query.lower() in text or sum(token in text_tokens for token in q_tokens) >= required:
+            filtered.append(hit)
+    return filtered
+
+
 def _merge_hits(primary: list[dict[str, Any]], secondary: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
     merged, seen = [], set()
     for hit in [*primary, *secondary]:
@@ -330,20 +277,18 @@ def search(query: str, limit: int = 20, offset: int = 0) -> dict[str, Any]:
         return {"estimatedTotalHits": 0, "hits": [], "source": "none"}
 
     candidate_limit = min(max(limit + offset, 30), 100)
+
+    # Live web is PRIMARY. The local crawl index is only a supplement.
+    web = _web_search(query, candidate_limit, 0)
+    web_hits = web.get("hits", [])
+
     local = _local_search(query, candidate_limit, 0)
-    local_hits = local.get("hits", [])
+    local_hits = _filter_relevant_local(local.get("hits", []), query)
     for hit in local_hits:
         hit.setdefault("source", "local")
 
-    # Never let a database/index failure prevent a live-web search.
-    web = _web_search(query, candidate_limit, 0)
-    merged = _merge_hits(local_hits, web.get("hits", []), candidate_limit)
+    merged = _merge_hits(web_hits, local_hits, candidate_limit)
     ranked = _rank_hits(merged, query)
     page = ranked[offset : offset + limit]
-    total = max(int(local.get("estimatedTotalHits", 0) or 0), int(web.get("estimatedTotalHits", 0) or 0), len(ranked))
-    return {
-        "estimatedTotalHits": total,
-        "hits": page,
-        "source": "local+web" if local_hits and web.get("hits") else ("local" if local_hits else "web" if web.get("hits") else "none"),
-        "provider_errors": web.get("provider_errors", []),
-    }
+    total = max(int(web.get("estimatedTotalHits", 0) or 0), int(local.get("estimatedTotalHits", 0) or 0), len(ranked))
+    return {"estimatedTotalHits": total, "hits": page, "source": "web+local" if web_hits and local_hits else ("web" if web_hits else "local" if local_hits else "none"), "provider_errors": web.get("provider_errors", [])}
