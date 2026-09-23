@@ -12,7 +12,7 @@ from .search_index import search
 
 origins = [origin.strip() for origin in os.getenv("API_CORS_ORIGINS", "http://localhost:3000").split(",") if origin.strip()]
 
-app = FastAPI(title="NisaanSearchEngine API", version="0.2.0")
+app = FastAPI(title="NisaanSearchEngine API", version="0.3.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
@@ -26,7 +26,7 @@ _last_crawl = 0.0
 
 @app.get("/health")
 def health() -> dict[str, str]:
-    return {"status": "ok", "service": "NisaanSearchEngine API", "version": "0.2.0"}
+    return {"status": "ok", "service": "NisaanSearchEngine API", "version": "0.3.0"}
 
 
 @app.get("/search")
@@ -50,10 +50,10 @@ def search_endpoint(
 
 @app.get("/crawl")
 def crawl_endpoint(
-    max_pages: int = Query(default=10, ge=1, le=10),
-    max_depth: int = Query(default=2, ge=0, le=2),
+    max_pages: int = Query(default=20, ge=1, le=20),
+    max_depth: int = Query(default=2, ge=0, le=3),
 ):
-    """Crawl configured public seed domains, including sitemap URLs and same-domain links."""
+    """Crawl configured and bootstrap public seed domains, including sitemaps and discovered links."""
     global _last_crawl
     now = time.time()
     if now - _last_crawl < 60:
