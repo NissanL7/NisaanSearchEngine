@@ -1,8 +1,8 @@
-"""Free-first hybrid search for NisaanSearchEngine.
+"""Search NisaanSearchEngine's own index, with an optional web provider.
 
-The local index is always preferred, but V1 also merges public Wikimedia
-results when available. Results are scored locally so title/domain matches,
-phrase matches, and term coverage rank above weak substring matches.
+The primary source is always the independently crawled Nisaan index. A web
+provider is only used when BRAVE_SEARCH_API_KEY is explicitly configured;
+Wikipedia is not used as a hidden search backend.
 """
 from __future__ import annotations
 
@@ -96,58 +96,11 @@ def _local_search(query: str, limit: int, offset: int) -> dict[str, Any]:
     return _supabase_search(query, limit, offset)
 
 
-def _wiki_language(query: str) -> str:
-    return "hi" if re.search(r"[\u0900-\u097F]", query) else "en"
-
-
-def _wikipedia_search(query: str, limit: int, offset: int) -> dict[str, Any]:
-    language = _wiki_language(query)
-    page_limit = min(max(limit, 1), 20)
-    params = {
-        "action": "query",
-        "list": "search",
-        "srsearch": query,
-        "srlimit": page_limit,
-        "sroffset": max(offset, 0),
-        "srprop": "snippet",
-        "format": "json",
-        "formatversion": "2",
-    }
-    headers = {"User-Agent": "NisaanSearchEngine/1.0 (https://github.com/NissanL7/NisaanSearchEngine)"}
-    with httpx.Client(timeout=15, follow_redirects=True) as client:
-        response = client.get(f"https://{language}.wikipedia.org/w/api.php", params=params, headers=headers)
-        response.raise_for_status()
-        data = response.json()
-
-    query_data = data.get("query", {})
-    raw_results = query_data.get("search", [])
-    hits = []
-    for item in raw_results:
-        title = item.get("title") or "Wikipedia"
-        page_id = item.get("pageid")
-        url = f"https://{language}.wikipedia.org/wiki/{title.replace(' ', '_')}"
-        snippet = re.sub(r"<[^>]+>", "", item.get("snippet") or "").strip()
-        hits.append({
-            "id": f"wiki-{page_id or abs(hash(url))}",
-            "url": url,
-            "title": title,
-            "description": snippet,
-            "content": snippet,
-            "domain": f"{language}.wikipedia.org",
-            "language": language,
-            "source": "wikipedia",
-        })
-    return {
-        "estimatedTotalHits": int(query_data.get("searchinfo", {}).get("totalhits") or len(hits)),
-        "hits": hits,
-    }
-
-
 def _brave_search(query: str, limit: int, offset: int) -> dict[str, Any]:
     if not BRAVE_API_KEY:
         return {"estimatedTotalHits": 0, "hits": []}
     page_size = min(max(limit, 1), 20)
-    params = {"q": query, "count": str(page_size), "offset": str(max(offset, 0)), "safesearch": "moderate"}
+    params = {"q": query, "count": str(page_size), "offset": max(offset, 0), "safesearch": "moderate"}
     headers = {"Accept": "application/json", "X-Subscription-Token": BRAVE_API_KEY}
     with httpx.Client(timeout=20) as client:
         response = client.get("https://api.search.brave.com/res/v1/web/search", headers=headers, params=params)
@@ -164,7 +117,7 @@ def _brave_search(query: str, limit: int, offset: int) -> dict[str, Any]:
             "description": item.get("description") or "",
             "content": item.get("description") or "",
             "domain": item.get("profile", {}).get("long_name") or "",
-            "source": "web",
+            "source": "web-provider",
         })
     return {"estimatedTotalHits": int(web.get("totalEstimatedMatches") or len(hits)), "hits": hits}
 
@@ -174,7 +127,6 @@ def _tokens(text: str) -> list[str]:
 
 
 def _score_hit(hit: dict[str, Any], query: str) -> float:
-    """Lightweight BM25-like relevance score without adding paid dependencies."""
     q = query.lower().strip()
     q_tokens = list(dict.fromkeys(_tokens(q)))
     title = str(hit.get("title") or "").lower()
@@ -193,26 +145,27 @@ def _score_hit(hit: dict[str, Any], query: str) -> float:
     if q and q in content:
         score += 8.0
 
+    title_tokens = _tokens(title)
+    domain_tokens = _tokens(domain)
+    description_tokens = _tokens(description)
+    content_tokens = _tokens(content)
     for token in q_tokens:
-        if token in _tokens(title):
+        if token in title_tokens:
             score += 28.0
-        if token in _tokens(domain):
+        if token in domain_tokens:
             score += 14.0
-        if token in _tokens(description):
+        if token in description_tokens:
             score += 8.0
-        if token in _tokens(content):
+        if token in content_tokens:
             score += min(12.0, 2.0 + content.count(token) * 1.5)
 
     coverage = sum(1 for token in q_tokens if token in haystack)
     if q_tokens:
         score += 25.0 * coverage / len(q_tokens)
 
-    # Give independently crawled pages a small source-quality advantage over fallback snippets.
-    source = str(hit.get("source") or "local")
-    if source == "local":
+    if str(hit.get("source") or "local") == "local":
         score += 6.0
 
-    # A small fuzzy bonus helps with minor misspellings without inventing results.
     if q and title:
         ratio = SequenceMatcher(None, q, title).ratio()
         if ratio >= 0.55:
@@ -233,7 +186,6 @@ def _rank_hits(hits: list[dict[str, Any]], query: str) -> list[dict[str, Any]]:
 
 
 def _merge_hits(primary: list[dict[str, Any]], secondary: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
-    """Merge results and deduplicate by normalized URL."""
     merged: list[dict[str, Any]] = []
     seen_urls: set[str] = set()
     for hit in [*primary, *secondary]:
@@ -248,39 +200,30 @@ def _merge_hits(primary: list[dict[str, Any]], secondary: list[dict[str, Any]], 
 
 
 def search(query: str, limit: int = 20, offset: int = 0) -> dict[str, Any]:
-    """Search local pages, Wikipedia, and optionally a configured web provider."""
+    """Search Nisaan's own index, optionally supplemented by a configured web provider."""
     query = query.strip()
     if not query:
         return {"estimatedTotalHits": 0, "hits": []}
 
-    # Fetch enough candidates to rank before applying pagination.
     candidate_limit = min(max(limit + offset, 20), 100)
     local = _local_search(query, candidate_limit, 0)
     local_hits = local.get("hits", [])
+    for hit in local_hits:
+        hit.setdefault("source", "local")
 
-    try:
-        wiki = _wikipedia_search(query, candidate_limit, 0)
-        wiki_hits = wiki.get("hits", [])
-    except Exception:
-        wiki = {"estimatedTotalHits": 0, "hits": []}
-        wiki_hits = []
-
-    merged = _merge_hits(local_hits, wiki_hits, candidate_limit)
-
-    if len(merged) < candidate_limit and BRAVE_API_KEY:
+    merged = list(local_hits)
+    web = {"estimatedTotalHits": 0, "hits": []}
+    if BRAVE_API_KEY and len(merged) < candidate_limit:
         try:
             web = _brave_search(query, candidate_limit, 0)
             merged = _merge_hits(merged, web.get("hits", []), candidate_limit)
         except Exception:
-            web = {"estimatedTotalHits": 0, "hits": []}
-    else:
-        web = {"estimatedTotalHits": 0, "hits": []}
+            pass
 
     ranked = _rank_hits(merged, query)
     page = ranked[offset:offset + limit]
     total = max(
         int(local.get("estimatedTotalHits", 0) or 0),
-        int(wiki.get("estimatedTotalHits", 0) or 0),
         int(web.get("estimatedTotalHits", 0) or 0),
         len(ranked),
     )
