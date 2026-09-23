@@ -10,11 +10,15 @@ from urllib.parse import urldefrag, urljoin, urlparse
 from urllib.robotparser import RobotFileParser
 
 import httpx
-import psycopg
 from bs4 import BeautifulSoup
 
 DATABASE_URL = os.getenv("DATABASE_URL", "")
-USER_AGENT = os.getenv("CRAWLER_USER_AGENT", "NisaanSearchEngineBot/0.1 (+https://github.com/NissanL7/NisaanSearchEngine)")
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
+SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_PUBLISHABLE_KEY", "")
+USER_AGENT = os.getenv(
+    "CRAWLER_USER_AGENT",
+    "NisaanSearchEngineBot/0.1 (+https://github.com/NissanL7/NisaanSearchEngine)",
+)
 DELAY = float(os.getenv("CRAWLER_REQUEST_DELAY_SECONDS", "1"))
 MAX_BYTES = 3 * 1024 * 1024
 
@@ -43,16 +47,72 @@ def allowed_by_robots(url: str, cache: dict[str, RobotFileParser]) -> bool:
     return cache[origin].can_fetch(USER_AGENT, url)
 
 
+def _supabase_headers() -> dict[str, str]:
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        raise RuntimeError("Supabase REST configuration is missing")
+    return {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json",
+    }
+
+
+def _get_seeds() -> list[str]:
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        raise RuntimeError("Supabase REST configuration is missing")
+    with httpx.Client(timeout=20) as client:
+        response = client.get(
+            f"{SUPABASE_URL}/rest/v1/crawl_seeds",
+            headers=_supabase_headers(),
+            params={"select": "url", "enabled": "eq.true", "order": "id"},
+        )
+        response.raise_for_status()
+        rows = response.json()
+    return [row["url"] for row in rows if row.get("url")]
+
+
+def _save_page(page: dict) -> None:
+    # Prefer Supabase REST for the free V1 deployment. PostgreSQL remains a
+    # fallback for installations that already provide DATABASE_URL.
+    if SUPABASE_URL and SUPABASE_KEY:
+        with httpx.Client(timeout=20) as client:
+            response = client.post(
+                f"{SUPABASE_URL}/rest/v1/pages",
+                headers={
+                    **_supabase_headers(),
+                    "Prefer": "resolution=merge-duplicates,return=minimal",
+                },
+                params={"on_conflict": "url"},
+                json=[page],
+            )
+            response.raise_for_status()
+        return
+
+    if DATABASE_URL:
+        import psycopg
+
+        with psycopg.connect(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """insert into pages
+                    (url,canonical_url,domain,title,description,content,status_code,content_hash,word_count,crawled_at,updated_at)
+                    values (%(url)s,%(url)s,%(domain)s,%(title)s,%(description)s,%(content)s,%(status)s,%(hash)s,%(words)s,now(),now())
+                    on conflict (url) do update set title=excluded.title,description=excluded.description,
+                    content=excluded.content,status_code=excluded.status_code,content_hash=excluded.content_hash,
+                    word_count=excluded.word_count,crawled_at=now(),updated_at=now()""",
+                    page,
+                )
+            conn.commit()
+        return
+
+    raise RuntimeError("No database or Supabase REST configuration is available")
+
+
 def crawl_seeds(max_pages: int = 10, max_depth: int = 1) -> int:
-    if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL is required")
+    seeds = [u for u in (normalize(s) for s in _get_seeds()) if u]
+    if not seeds:
+        return 0
 
-    with psycopg.connect(DATABASE_URL) as conn:
-        with conn.cursor() as cur:
-            cur.execute("select url from crawl_seeds where enabled = true order by id")
-            seeds = [row[0] for row in cur.fetchall()]
-
-    seeds = [u for u in (normalize(s) for s in seeds) if u]
     queue: deque[tuple[str, int]] = deque((u, 0) for u in seeds)
     seen = set(seeds)
     robots: dict[str, RobotFileParser] = {}
@@ -80,20 +140,18 @@ def crawl_seeds(max_pages: int = 10, max_depth: int = 1) -> int:
             content = re.sub(r"\s+", " ", " ".join(soup.stripped_strings)).strip()
             digest = hashlib.sha256(content.encode("utf-8", errors="ignore")).hexdigest()
 
-            with psycopg.connect(DATABASE_URL) as conn:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        """insert into pages
-                        (url,canonical_url,domain,title,description,content,status_code,content_hash,word_count,crawled_at,updated_at)
-                        values (%(url)s,%(url)s,%(domain)s,%(title)s,%(description)s,%(content)s,%(status)s,%(hash)s,%(words)s,now(),now())
-                        on conflict (url) do update set title=excluded.title,description=excluded.description,
-                        content=excluded.content,status_code=excluded.status_code,content_hash=excluded.content_hash,
-                        word_count=excluded.word_count,crawled_at=now(),updated_at=now()""",
-                        {"url": url, "domain": urlparse(url).netloc, "title": title[:1000],
-                         "description": description[:3000], "content": content[:1000000],
-                         "status": response.status_code, "hash": digest, "words": len(content.split())},
-                    )
-                conn.commit()
+            page = {
+                "url": url,
+                "canonical_url": url,
+                "domain": urlparse(url).netloc,
+                "title": title[:1000],
+                "description": description[:3000],
+                "content": content[:1000000],
+                "status_code": response.status_code,
+                "content_hash": digest,
+                "word_count": len(content.split()),
+            }
+            _save_page(page)
             saved += 1
 
             if depth < max_depth and response.is_success:
