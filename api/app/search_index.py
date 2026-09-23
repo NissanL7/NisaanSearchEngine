@@ -1,4 +1,9 @@
-"""Search adapter with Meilisearch, PostgreSQL, and Supabase REST fallbacks."""
+"""Search adapter with local index plus optional live Brave web search.
+
+Local results remain the project's own index. When BRAVE_SEARCH_API_KEY is
+configured, live web results are used to fill searches that the local index
+cannot satisfy. Live provider results are not persisted.
+"""
 from __future__ import annotations
 
 import os
@@ -13,6 +18,7 @@ INDEX_NAME = os.getenv("MEILISEARCH_INDEX", "pages")
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
 SUPABASE_KEY = os.getenv("SUPABASE_PUBLISHABLE_KEY", "")
+BRAVE_API_KEY = os.getenv("BRAVE_SEARCH_API_KEY", "")
 
 
 def _meili_search(query: str, limit: int, offset: int) -> dict[str, Any]:
@@ -52,8 +58,6 @@ def _supabase_search(query: str, limit: int, offset: int) -> dict[str, Any]:
     if not SUPABASE_URL or not SUPABASE_KEY:
         raise RuntimeError("Supabase REST configuration is missing")
 
-    # Keep the free V1 search deliberately simple. Supabase/PostgREST performs
-    # the filtering server-side; httpx handles URL encoding for the parameters.
     safe_query = query.replace("*", " ").strip()
     or_filter = (
         f"(title.ilike.*{safe_query}*,"
@@ -76,7 +80,7 @@ def _supabase_search(query: str, limit: int, offset: int) -> dict[str, Any]:
     return {"estimatedTotalHits": len(hits) + offset, "hits": hits}
 
 
-def search(query: str, limit: int = 20, offset: int = 0) -> dict[str, Any]:
+def _local_search(query: str, limit: int, offset: int) -> dict[str, Any]:
     if MEILI_URL:
         try:
             return _meili_search(query, limit, offset)
@@ -88,3 +92,69 @@ def search(query: str, limit: int = 20, offset: int = 0) -> dict[str, Any]:
         except Exception:
             pass
     return _supabase_search(query, limit, offset)
+
+
+def _brave_search(query: str, limit: int, offset: int) -> dict[str, Any]:
+    """Search the live public web through Brave's independent web index.
+
+    Results are returned directly and deliberately not persisted. Brave's
+    current API terms restrict retaining API response data unless the account
+    has the appropriate storage rights.
+    """
+    if not BRAVE_API_KEY:
+        return {"estimatedTotalHits": 0, "hits": []}
+
+    # Brave uses 1-based pagination. Keep this endpoint bounded for V1.
+    page = (offset // max(limit, 1)) + 1
+    params = {
+        "q": query,
+        "count": str(min(limit, 20)),
+        "offset": str(max(page - 1, 0) * min(limit, 20)),
+        "safesearch": "moderate",
+    }
+    headers = {
+        "Accept": "application/json",
+        "X-Subscription-Token": BRAVE_API_KEY,
+    }
+    with httpx.Client(timeout=20) as client:
+        response = client.get(
+            "https://api.search.brave.com/res/v1/web/search",
+            headers=headers,
+            params=params,
+        )
+        response.raise_for_status()
+        data = response.json()
+
+    web = data.get("web", {})
+    raw_results = web.get("results", [])
+    hits = []
+    for index, item in enumerate(raw_results):
+        url = item.get("url") or ""
+        hits.append(
+            {
+                "id": f"web-{offset + index}-{abs(hash(url))}",
+                "url": url,
+                "title": item.get("title") or url,
+                "description": item.get("description") or "",
+                "content": item.get("description") or "",
+                "domain": item.get("profile", {}).get("long_name") or "",
+                "source": "web",
+            }
+        )
+    return {
+        "estimatedTotalHits": int(web.get("totalEstimatedMatches") or len(hits)),
+        "hits": hits,
+    }
+
+
+def search(query: str, limit: int = 20, offset: int = 0) -> dict[str, Any]:
+    """Hybrid search: own index first, then live web coverage when enabled."""
+    local = _local_search(query, limit, offset)
+    local_hits = local.get("hits", [])
+
+    # Keep our own index authoritative when it has matching pages. If it has
+    # no matches, use the live web index so ordinary queries don't look empty.
+    if local_hits or not BRAVE_API_KEY:
+        return local
+
+    return _brave_search(query, limit, offset)
