@@ -1,7 +1,9 @@
 """Controlled free-first crawler for NisaanSearchEngine.
 
-The crawler respects robots.txt, discovers same-domain links and sitemaps,
-and keeps strict page/depth limits so the free Render service is not abused.
+The crawler respects robots.txt, discovers sitemaps and same-domain links,
+and gradually expands the frontier to newly discovered domains. Limits keep
+free infrastructure safe while allowing the index to grow beyond the initial
+seed sites.
 """
 from __future__ import annotations
 
@@ -21,10 +23,11 @@ SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_PUBLISHABLE_KEY", "")
 USER_AGENT = os.getenv(
     "CRAWLER_USER_AGENT",
-    "NisaanSearchEngineBot/0.1 (+https://github.com/NissanL7/NisaanSearchEngine)",
+    "NisaanSearchEngineBot/0.2 (+https://github.com/NissanL7/NisaanSearchEngine)",
 )
 DELAY = float(os.getenv("CRAWLER_REQUEST_DELAY_SECONDS", "1"))
 MAX_BYTES = 3 * 1024 * 1024
+MAX_NEW_DOMAINS_PER_RUN = int(os.getenv("CRAWLER_MAX_NEW_DOMAINS", "5"))
 
 
 def normalize(url: str, base: str | None = None) -> str | None:
@@ -69,6 +72,24 @@ def _get_seeds() -> list[str]:
     return [row["url"] for row in rows if row.get("url")]
 
 
+def _save_seed(url: str) -> None:
+    """Persist a newly discovered domain as a future crawl starting point."""
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return
+    try:
+        with httpx.Client(timeout=15) as client:
+            response = client.post(
+                f"{SUPABASE_URL}/rest/v1/crawl_seeds",
+                headers={**_supabase_headers(), "Prefer": "resolution=merge-duplicates,return=minimal"},
+                params={"on_conflict": "url"},
+                json=[{"url": url, "enabled": True, "max_depth": 2}],
+            )
+            response.raise_for_status()
+    except httpx.HTTPError:
+        # Discovery should never make an otherwise successful crawl fail.
+        return
+
+
 def _save_page(page: dict) -> None:
     if SUPABASE_URL and SUPABASE_KEY:
         with httpx.Client(timeout=20) as client:
@@ -100,12 +121,6 @@ def _save_page(page: dict) -> None:
 
 
 def _discover_sitemap_urls(seed: str, client: httpx.Client, limit: int = 40) -> list[str]:
-    """Read a site's sitemap and return URLs on the same host.
-
-    We only inspect standard sitemap locations and never follow sitemap links
-    to unrelated hosts. Sitemap discovery gives V1 much better coverage than
-    relying only on links visible on a homepage.
-    """
     p = urlparse(seed)
     origin = f"{p.scheme}://{p.netloc}"
     candidates = [f"{origin}/sitemap.xml", f"{origin}/sitemap_index.xml"]
@@ -116,7 +131,6 @@ def _discover_sitemap_urls(seed: str, client: httpx.Client, limit: int = 40) -> 
             if not response.is_success:
                 continue
             text = response.text[:2_000_000]
-            # Works for normal sitemaps and simple sitemap indexes.
             for match in re.findall(r"<loc>\s*(.*?)\s*</loc>", text, flags=re.I | re.S):
                 candidate = normalize(match)
                 if candidate and urlparse(candidate).netloc == p.netloc:
@@ -162,10 +176,10 @@ def crawl_seeds(max_pages: int = 10, max_depth: int = 2) -> int:
     seen = set(seeds)
     robots: dict[str, RobotFileParser] = {}
     saved = 0
+    new_domains: set[str] = set()
     headers = {"User-Agent": USER_AGENT, "Accept": "text/html,application/xhtml+xml"}
 
     with httpx.Client(headers=headers, follow_redirects=True, timeout=12) as client:
-        # Add sitemap URLs before normal link crawling. They remain same-domain.
         for seed in seeds:
             for sitemap_url in _discover_sitemap_urls(seed, client, limit=20):
                 if sitemap_url not in seen:
@@ -188,12 +202,24 @@ def crawl_seeds(max_pages: int = 10, max_depth: int = 2) -> int:
             saved += 1
 
             if depth < max_depth and response.is_success:
-                domain = urlparse(url).netloc
+                current_domain = urlparse(url).netloc
                 for a in soup.find_all("a", href=True):
                     link = normalize(a.get("href", ""), url)
-                    if link and urlparse(link).netloc == domain and link not in seen:
-                        seen.add(link)
-                        queue.append((link, depth + 1))
+                    if not link:
+                        continue
+                    link_domain = urlparse(link).netloc
+                    if link_domain == current_domain:
+                        if link not in seen:
+                            seen.add(link)
+                            queue.append((link, depth + 1))
+                    elif link_domain and len(new_domains) < MAX_NEW_DOMAINS_PER_RUN:
+                        # Grow the independent web frontier gradually. We store
+                        # only the domain root, then future runs crawl it under
+                        # the same robots/depth controls.
+                        domain_root = f"{urlparse(link).scheme}://{link_domain}/"
+                        if link_domain not in new_domains:
+                            new_domains.add(link_domain)
+                            _save_seed(domain_root)
             time.sleep(DELAY)
 
     return saved
