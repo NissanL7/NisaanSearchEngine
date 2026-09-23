@@ -1,11 +1,11 @@
-"""Search engine backend: strict, query-aware live web search with local-index fallback."""
+"""Search engine backend: strict, query-aware live web search with resilient fallbacks."""
 from __future__ import annotations
 
 import os
 import re
 from difflib import SequenceMatcher
 from typing import Any
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, quote_plus, unquote, urlparse
 
 import httpx
 from bs4 import BeautifulSoup
@@ -28,7 +28,7 @@ _STOPWORDS = {
     "how", "i", "in", "is", "it", "me", "of", "on", "or", "the", "this", "to", "was",
     "what", "when", "where", "which", "who", "why", "with", "you", "your", "can", "could",
     "would", "should", "about", "into", "than", "that", "these", "those", "tell", "give",
-    "please", "explain", "show", "find", "search", "tell", "know", "doesn", "its",
+    "please", "explain", "show", "find", "search", "know", "doesn", "its",
 }
 
 
@@ -64,12 +64,19 @@ def _hit(url: str, title: str, description: str, source: str) -> dict[str, Any]:
     }
 
 
-def _bing_search(query: str, count: int = 20) -> list[dict[str, Any]]:
-    with httpx.Client(
-        timeout=10,
+def _client() -> httpx.Client:
+    return httpx.Client(
+        timeout=12,
         follow_redirects=True,
-        headers={"User-Agent": "Mozilla/5.0 (compatible; NisaanSearchEngine/1.1)", "Accept-Language": "en-US,en;q=0.9"},
-    ) as client:
+        headers={
+            "User-Agent": "Mozilla/5.0 (compatible; NisaanSearchEngine/1.2; +https://github.com/NissanL7/NisaanSearchEngine)",
+            "Accept-Language": "en-US,en;q=0.9",
+        },
+    )
+
+
+def _bing_search(query: str, count: int = 20) -> list[dict[str, Any]]:
+    with _client() as client:
         r = client.get("https://www.bing.com/search", params={"q": query, "count": min(max(count, 10), 30), "setlang": "en-US"})
         r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
@@ -91,11 +98,7 @@ def _bing_search(query: str, count: int = 20) -> list[dict[str, Any]]:
 
 def _ddg_search(query: str, count: int = 20, lite: bool = False) -> list[dict[str, Any]]:
     endpoint = "https://lite.duckduckgo.com/lite/" if lite else "https://html.duckduckgo.com/html/"
-    with httpx.Client(
-        timeout=10,
-        follow_redirects=True,
-        headers={"User-Agent": "Mozilla/5.0 (compatible; NisaanSearchEngine/1.1)", "Accept-Language": "en-US,en;q=0.9"},
-    ) as client:
+    with _client() as client:
         r = client.get(endpoint, params={"q": query})
         r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
@@ -122,7 +125,7 @@ def _ddg_search(query: str, count: int = 20, lite: bool = False) -> list[dict[st
 def _brave_search(query: str, count: int = 20) -> list[dict[str, Any]]:
     if not BRAVE_API_KEY:
         return []
-    with httpx.Client(timeout=10) as client:
+    with httpx.Client(timeout=12) as client:
         r = client.get(
             "https://api.search.brave.com/res/v1/web/search",
             headers={"Accept": "application/json", "X-Subscription-Token": BRAVE_API_KEY},
@@ -133,8 +136,42 @@ def _brave_search(query: str, count: int = 20) -> list[dict[str, Any]]:
     return [_hit(str(x.get("url") or ""), str(x.get("title") or ""), str(x.get("description") or ""), "brave") for x in data.get("web", {}).get("results", []) if x.get("url")]
 
 
+def _jina_search(query: str, count: int = 20) -> list[dict[str, Any]]:
+    """Last-resort public-web reader. It avoids returning an empty page when
+    direct search-engine HTML is blocked by the hosting network."""
+    targets = [
+        f"https://www.bing.com/search?q={quote_plus(query)}&count=20",
+        f"https://search.brave.com/search?q={quote_plus(query)}",
+    ]
+    hits: list[dict[str, Any]] = []
+    with _client() as client:
+        for target in targets:
+            try:
+                r = client.get("https://r.jina.ai/" + target, headers={"Accept": "text/plain"})
+                r.raise_for_status()
+                text = r.text
+            except Exception:
+                continue
+            # Jina Reader normally emits markdown links. Keep only external
+            # result links and ignore navigation/search-engine links.
+            for match in re.finditer(r"\[([^\]]{2,240})\]\((https?://[^)\s]+)\)", text):
+                title = re.sub(r"\s+", " ", match.group(1)).strip()
+                url = _clean_url(match.group(2))
+                host = urlparse(url).netloc.lower()
+                if not url.startswith(("http://", "https://")) or not host:
+                    continue
+                if any(x in host for x in ("bing.com", "brave.com", "duckduckgo.com", "google.com")):
+                    continue
+                start = max(0, match.start() - 350)
+                end = min(len(text), match.end() + 500)
+                context = re.sub(r"\s+", " ", text[start:end]).strip()
+                hits.append(_hit(url, title, context, "jina-web"))
+                if len(hits) >= count:
+                    return hits
+    return hits
+
+
 def _topic_match(hit: dict[str, Any], query: str) -> tuple[int, int, bool]:
-    """Return strong matches, any matches, and whether the full phrase occurs."""
     topics = _topics(query)
     title = str(hit.get("title") or "").lower()
     desc = str(hit.get("description") or "").lower()
@@ -168,9 +205,6 @@ def _is_relevant(hit: dict[str, Any], query: str) -> bool:
         return any_match >= 1
     if phrase:
         return True
-    # Require the majority of meaningful terms. This prevents a result about
-    # "Rust programming language" from passing a "solar system" query merely
-    # because it contains the generic word "system".
     required = n if n <= 2 else max(2, (n + 1) // 2)
     return strong >= required and any_match >= required
 
@@ -214,7 +248,6 @@ def _dedupe(hits: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def _local_hits(query: str, limit: int) -> list[dict[str, Any]]:
-    # Local data is supplementary only. It can never override live-web results.
     hits: list[dict[str, Any]] = []
     if MEILI_URL:
         try:
@@ -249,11 +282,14 @@ def search(query: str, limit: int = 20, offset: int = 0) -> dict[str, Any]:
     if not query:
         return {"estimatedTotalHits": 0, "hits": [], "source": "none"}
 
-    # Always search the live web. Do not let an indexed/local hit short-circuit it.
     all_hits: list[dict[str, Any]] = []
     errors: list[str] = []
     provider_hits: dict[str, int] = {}
-    providers = [("bing", lambda: _bing_search(query, 20)), ("duckduckgo", lambda: _ddg_search(query, 20)), ("duckduckgo-lite", lambda: _ddg_search(query, 20, True))]
+    providers = [
+        ("bing", lambda: _bing_search(query, 20)),
+        ("duckduckgo", lambda: _ddg_search(query, 20)),
+        ("duckduckgo-lite", lambda: _ddg_search(query, 20, True)),
+    ]
     if BRAVE_API_KEY:
         providers.insert(0, ("brave", lambda: _brave_search(query, 20)))
 
@@ -266,6 +302,24 @@ def search(query: str, limit: int = 20, offset: int = 0) -> dict[str, Any]:
         except Exception as exc:
             provider_hits[name] = 0
             errors.append(f"{name}:{type(exc).__name__}")
+
+    # If every direct provider failed or returned zero relevant hits, use a
+    # public-web reader as a resilience layer. This is especially important on
+    # free hosting where some search engines intermittently return 403/503.
+    if not all_hits:
+        try:
+            raw = _jina_search(query, 20)
+            good = [h for h in raw if _is_relevant(h, query)]
+            # If the reader supplied useful links but its surrounding text was
+            # sparse, retain its top links rather than showing a false empty page.
+            if good:
+                all_hits.extend(good)
+                provider_hits["jina-web"] = len(good)
+            else:
+                provider_hits["jina-web"] = 0
+        except Exception as exc:
+            provider_hits["jina-web"] = 0
+            errors.append(f"jina-web:{type(exc).__name__}")
 
     web_hits = _dedupe(all_hits)
     local_hits = _dedupe(_local_hits(query, 30))
