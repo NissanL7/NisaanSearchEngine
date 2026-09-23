@@ -29,6 +29,18 @@ export default function Home() {
     return () => clearTimeout(timer);
   }, [query]);
 
+  function handleQueryChange(value:string) {
+    setQuery(value);
+    // Never show results belonging to a different, unsubmitted query.
+    // This prevents a user from typing a new query while the previous
+    // result page remains visible and looks like the new search failed.
+    setResults([]);
+    setTotal(0);
+    setSearched(false);
+    setError('');
+    setPage(0);
+  }
+
   async function runSearch(e?:FormEvent, nextPage=0, selectedQuery?:string) {
     e?.preventDefault();
     const q=(selectedQuery ?? query).trim(); if(!q) return;
@@ -53,7 +65,7 @@ export default function Home() {
     </section>
     <form className="search" onSubmit={runSearch}>
       <div className="searchbox">
-        <input value={query} onChange={e=>setQuery(e.target.value)} placeholder="Search the web..." aria-label="Search" autoComplete="off" />
+        <input value={query} onChange={e=>handleQueryChange(e.target.value)} placeholder="Search the web..." aria-label="Search" autoComplete="off" />
         {suggestions.length>0 && <div className="suggestions" role="listbox">
           {suggestions.map((s)=><button type="button" key={s} onMouseDown={(e)=>e.preventDefault()} onClick={()=>runSearch(undefined,0,s)}>{s}</button>)}
         </div>}
@@ -62,7 +74,7 @@ export default function Home() {
     </form>
     {searched && <div className="status">{loading ? 'Searching…' : error ? `Search error: ${error}` : `${total.toLocaleString()} results`}</div>}
     {!loading && searched && !error && results.length===0 && <div className="empty">No results found. Try another search.</div>}
-    {!loading && results.map(r=><article className="result" key={r.id}>
+    {!loading && searched && !error && results.map(r=><article className="result" key={r.id}>
       <h2><a href={r.url} target="_blank" rel="noreferrer">{r.title || r.url}</a></h2>
       <div className="url">{r.url}</div>
       <p className="snippet">{r.description || (r.content||'').slice(0,240)}</p>
