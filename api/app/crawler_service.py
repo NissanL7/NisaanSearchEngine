@@ -10,6 +10,7 @@ import hashlib
 import os
 import re
 import time
+from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urldefrag, urljoin, urlparse
 from urllib.robotparser import RobotFileParser
@@ -113,15 +114,37 @@ def _requeue_stale(limit: int = 50) -> None:
 
 
 def _get_frontier(limit: int) -> list[tuple[int, str, int]]:
+    """Return a domain-diverse frontier instead of letting one seed dominate.
+
+    The old FIFO queue could consume all available crawl slots on the first
+    seed (for example python.org). We fetch a wider candidate set and select
+    round-robin by hostname, so each scheduled run expands coverage across
+    many independent websites.
+    """
     _requeue_stale(limit=max(limit * 2, 20))
+    candidate_limit = min(max(limit * 8, 80), 500)
     with httpx.Client(timeout=20) as client:
         r = client.get(
             f"{SUPABASE_URL}/rest/v1/crawl_queue",
             headers=_headers(),
-            params={"select": "id,url,depth", "status": "eq.pending", "next_attempt_at": "lte.now()", "order": "id", "limit": str(limit)},
+            params={"select": "id,url,depth", "status": "eq.pending", "next_attempt_at": "lte.now()", "order": "id", "limit": str(candidate_limit)},
         )
         r.raise_for_status()
-        return [(int(x["id"]), x["url"], int(x.get("depth") or 0)) for x in r.json()]
+        rows = [(int(x["id"]), x["url"], int(x.get("depth") or 0)) for x in r.json()]
+
+    buckets: dict[str, deque[tuple[int, str, int]]] = defaultdict(deque)
+    for row in rows:
+        buckets[urlparse(row[1]).netloc].append(row)
+
+    domains = deque(sorted(buckets))
+    selected: list[tuple[int, str, int]] = []
+    while domains and len(selected) < limit:
+        domain = domains.popleft()
+        bucket = buckets[domain]
+        selected.append(bucket.popleft())
+        if bucket:
+            domains.append(domain)
+    return selected
 
 
 def _mark_queue(item_id: int, status: str, error: str | None = None) -> None:
