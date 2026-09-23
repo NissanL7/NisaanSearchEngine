@@ -12,7 +12,7 @@ jobs:
       - name: Trigger controlled crawler
         run: |
           set -e
-          url='https://nisaan-searchengine-api.onrender.com/crawl?max_pages=10'
+          url='https://nisaan-searchengine-api.onrender.com/crawl?max_pages=10&max_depth=2'
           for attempt in 1 2 3 4 5; do
             echo "Crawler attempt ${attempt}/5"
             if curl --fail --show-error --silent --max-time 120 "$url"; then
