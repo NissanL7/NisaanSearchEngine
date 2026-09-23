@@ -1,9 +1,8 @@
-"""Hybrid search for NisaanSearchEngine.
+"""Free-first hybrid search for NisaanSearchEngine.
 
-The project stays free-first: search the project's own index first, then use
-Wikimedia's public search API as a no-key fallback when the local index has no
-match. Optional paid/provider integrations can be added later without making
-them required.
+The local index is always preferred, but V1 also merges public Wikimedia
+results when available. This means a query can return useful results even
+when NisaanSearchEngine has not crawled that topic yet.
 """
 from __future__ import annotations
 
@@ -59,10 +58,9 @@ def _postgres_search(query: str, limit: int, offset: int) -> dict[str, Any]:
 def _supabase_search(query: str, limit: int, offset: int) -> dict[str, Any]:
     if not SUPABASE_URL or not SUPABASE_KEY:
         raise RuntimeError("Supabase REST configuration is missing")
-
     safe_query = query.replace("*", " ").replace(",", " ").strip()
-    # Search the complete phrase first. This keeps the existing simple REST
-    # index inexpensive; the public-web fallback handles queries absent locally.
+    # Escape characters that could change PostgREST filter syntax.
+    safe_query = safe_query.replace("%", " ").replace("(", " ").replace(")", " ")
     or_filter = (
         f"(title.ilike.*{safe_query}*,"
         f"description.ilike.*{safe_query}*,"
@@ -99,14 +97,11 @@ def _local_search(query: str, limit: int, offset: int) -> dict[str, Any]:
 
 
 def _wiki_language(query: str) -> str:
-    # Use Hindi Wikipedia for Devanagari queries; English otherwise.
     return "hi" if re.search(r"[\u0900-\u097F]", query) else "en"
 
 
 def _wikipedia_search(query: str, limit: int, offset: int) -> dict[str, Any]:
-    """Free no-key fallback using Wikimedia's public MediaWiki search API."""
     language = _wiki_language(query)
-    # MediaWiki's search endpoint has a bounded page size; keep V1 cheap.
     page_limit = min(max(limit, 1), 20)
     params = {
         "action": "query",
@@ -118,15 +113,9 @@ def _wikipedia_search(query: str, limit: int, offset: int) -> dict[str, Any]:
         "format": "json",
         "formatversion": "2",
     }
-    headers = {
-        "User-Agent": "NisaanSearchEngine/1.0 (https://github.com/NissanL7/NisaanSearchEngine)"
-    }
+    headers = {"User-Agent": "NisaanSearchEngine/1.0 (https://github.com/NissanL7/NisaanSearchEngine)"}
     with httpx.Client(timeout=15, follow_redirects=True) as client:
-        response = client.get(
-            f"https://{language}.wikipedia.org/w/api.php",
-            params=params,
-            headers=headers,
-        )
+        response = client.get(f"https://{language}.wikipedia.org/w/api.php", params=params, headers=headers)
         response.raise_for_status()
         data = response.json()
 
@@ -138,19 +127,16 @@ def _wikipedia_search(query: str, limit: int, offset: int) -> dict[str, Any]:
         page_id = item.get("pageid")
         url = f"https://{language}.wikipedia.org/wiki/{title.replace(' ', '_')}"
         snippet = re.sub(r"<[^>]+>", "", item.get("snippet") or "").strip()
-        hits.append(
-            {
-                "id": f"wiki-{page_id or abs(hash(url))}",
-                "url": url,
-                "title": title,
-                "description": snippet,
-                "content": snippet,
-                "domain": f"{language}.wikipedia.org",
-                "language": language,
-                "source": "wikipedia",
-            }
-        )
-
+        hits.append({
+            "id": f"wiki-{page_id or abs(hash(url))}",
+            "url": url,
+            "title": title,
+            "description": snippet,
+            "content": snippet,
+            "domain": f"{language}.wikipedia.org",
+            "language": language,
+            "source": "wikipedia",
+        })
     return {
         "estimatedTotalHits": int(query_data.get("searchinfo", {}).get("totalhits") or len(hits)),
         "hits": hits,
@@ -158,66 +144,77 @@ def _wikipedia_search(query: str, limit: int, offset: int) -> dict[str, Any]:
 
 
 def _brave_search(query: str, limit: int, offset: int) -> dict[str, Any]:
-    """Optional live-web provider. Never required for the free setup."""
     if not BRAVE_API_KEY:
         return {"estimatedTotalHits": 0, "hits": []}
-
     page_size = min(max(limit, 1), 20)
-    params = {
-        "q": query,
-        "count": str(page_size),
-        "offset": str(max(offset, 0)),
-        "safesearch": "moderate",
-    }
+    params = {"q": query, "count": str(page_size), "offset": str(max(offset, 0)), "safesearch": "moderate"}
     headers = {"Accept": "application/json", "X-Subscription-Token": BRAVE_API_KEY}
     with httpx.Client(timeout=20) as client:
-        response = client.get(
-            "https://api.search.brave.com/res/v1/web/search",
-            headers=headers,
-            params=params,
-        )
+        response = client.get("https://api.search.brave.com/res/v1/web/search", headers=headers, params=params)
         response.raise_for_status()
         data = response.json()
-
     web = data.get("web", {})
     hits = []
     for index, item in enumerate(web.get("results", [])):
         url = item.get("url") or ""
-        hits.append(
-            {
-                "id": f"web-{offset + index}-{abs(hash(url))}",
-                "url": url,
-                "title": item.get("title") or url,
-                "description": item.get("description") or "",
-                "content": item.get("description") or "",
-                "domain": item.get("profile", {}).get("long_name") or "",
-                "source": "web",
-            }
-        )
-    return {
-        "estimatedTotalHits": int(web.get("totalEstimatedMatches") or len(hits)),
-        "hits": hits,
-    }
+        hits.append({
+            "id": f"web-{offset + index}-{abs(hash(url))}",
+            "url": url,
+            "title": item.get("title") or url,
+            "description": item.get("description") or "",
+            "content": item.get("description") or "",
+            "domain": item.get("profile", {}).get("long_name") or "",
+            "source": "web",
+        })
+    return {"estimatedTotalHits": int(web.get("totalEstimatedMatches") or len(hits)), "hits": hits}
+
+
+def _merge_hits(primary: list[dict[str, Any]], secondary: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+    """Merge local and public results while deduplicating URLs."""
+    merged: list[dict[str, Any]] = []
+    seen_urls: set[str] = set()
+    for hit in [*primary, *secondary]:
+        url = str(hit.get("url") or "").rstrip("/")
+        if not url or url in seen_urls:
+            continue
+        seen_urls.add(url)
+        merged.append(hit)
+        if len(merged) >= limit:
+            break
+    return merged
 
 
 def search(query: str, limit: int = 20, offset: int = 0) -> dict[str, Any]:
-    """Search local index first, then free Wikimedia, then optional web provider."""
+    """Search local pages, then fill missing slots with free Wikimedia results.
+
+    If a live provider key is configured, it is used only when both local and
+    Wikimedia results are insufficient. No paid service is required for V1.
+    """
+    query = query.strip()
     local = _local_search(query, limit, offset)
     local_hits = local.get("hits", [])
-    if local_hits:
-        return local
 
+    # Keep local results first, but don't stop just because one local page matched.
+    wiki_hits: list[dict[str, Any]] = []
     try:
-        wiki = _wikipedia_search(query, limit, offset)
-        if wiki.get("hits"):
-            return wiki
+        wiki = _wikipedia_search(query, limit, 0)
+        wiki_hits = wiki.get("hits", [])
     except Exception:
-        pass
+        wiki = {"estimatedTotalHits": 0, "hits": []}
+
+    merged = _merge_hits(local_hits, wiki_hits, limit)
+    if len(merged) >= limit:
+        return {"estimatedTotalHits": max(local.get("estimatedTotalHits", 0), len(merged)), "hits": merged[offset:offset + limit]}
 
     if BRAVE_API_KEY:
         try:
-            return _brave_search(query, limit, offset)
+            web = _brave_search(query, limit, 0)
+            merged = _merge_hits(merged, web.get("hits", []), limit)
+            if merged:
+                return {"estimatedTotalHits": max(local.get("estimatedTotalHits", 0), web.get("estimatedTotalHits", 0), len(merged)), "hits": merged[offset:offset + limit]}
         except Exception:
             pass
 
+    if merged:
+        return {"estimatedTotalHits": max(local.get("estimatedTotalHits", 0), wiki.get("estimatedTotalHits", 0), len(merged)), "hits": merged[offset:offset + limit]}
     return local
