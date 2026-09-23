@@ -12,6 +12,15 @@ jobs:
       - name: Trigger controlled crawler
         run: |
           set -e
-          curl --fail --show-error --silent \
-            --max-time 90 \
-            'https://nisaan-searchengine-api.onrender.com/crawl?max_pages=10'
+          url='https://nisaan-searchengine-api.onrender.com/crawl?max_pages=10'
+          for attempt in 1 2 3 4 5; do
+            echo "Crawler attempt ${attempt}/5"
+            if curl --fail --show-error --silent --max-time 120 "$url"; then
+              echo
+              exit 0
+            fi
+            echo "Crawler returned an error; waiting 20 seconds before retry..."
+            sleep 20
+          done
+          echo "Crawler failed after 5 attempts"
+          exit 1
