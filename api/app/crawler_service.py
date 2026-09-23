@@ -19,11 +19,38 @@ from bs4 import BeautifulSoup
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_PUBLISHABLE_KEY", "")
-USER_AGENT = os.getenv("CRAWLER_USER_AGENT", "NisaanSearchEngineBot/0.4 (+https://github.com/NissanL7/NisaanSearchEngine)")
+USER_AGENT = os.getenv("CRAWLER_USER_AGENT", "NisaanSearchEngineBot/0.5 (+https://github.com/NissanL7/NisaanSearchEngine)")
 DELAY = float(os.getenv("CRAWLER_REQUEST_DELAY_SECONDS", "1"))
 MAX_BYTES = 3 * 1024 * 1024
-MAX_NEW_DOMAINS_PER_RUN = int(os.getenv("CRAWLER_MAX_NEW_DOMAINS", "5"))
+MAX_CONTENT_CHARS = 250_000
+MAX_NEW_DOMAINS_PER_RUN = int(os.getenv("CRAWLER_MAX_NEW_DOMAINS", "10"))
 RECrawl_DAYS = int(os.getenv("CRAWLER_RECRAWL_DAYS", "7"))
+
+# Free-first bootstrap sources. They are only starting points: the crawler
+# follows permitted links and sitemaps from these domains and gradually grows
+# the independent index over repeated scheduled runs.
+DEFAULT_SEEDS = [
+    "https://www.python.org/",
+    "https://developer.mozilla.org/",
+    "https://stackoverflow.com/",
+    "https://github.com/",
+    "https://www.npmjs.com/",
+    "https://pypi.org/",
+    "https://nodejs.org/",
+    "https://react.dev/",
+    "https://nextjs.org/",
+    "https://www.rust-lang.org/",
+    "https://go.dev/",
+    "https://developer.android.com/",
+    "https://learn.microsoft.com/",
+    "https://developer.apple.com/",
+    "https://web.dev/",
+    "https://huggingface.co/",
+    "https://arxiv.org/",
+    "https://www.kaggle.com/",
+    "https://archive.org/",
+    "https://en.wikipedia.org/",
+]
 
 
 def normalize(url: str, base: str | None = None) -> str | None:
@@ -36,7 +63,6 @@ def normalize(url: str, base: str | None = None) -> str | None:
     host = p.hostname.lower()
     port = f":{p.port}" if p.port and p.port not in {80, 443} else ""
     path = re.sub(r"/{2,}", "/", p.path or "/")
-    # Tracking parameters should not create a new canonical crawl URL.
     query_parts = [part for part in p.query.split("&") if part and not part.lower().startswith(("utm_", "fbclid=", "gclid="))]
     query = "&".join(query_parts)
     return f"{p.scheme.lower()}://{host}{port}{path}" + (f"?{query}" if query else "")
@@ -49,10 +75,12 @@ def _headers() -> dict[str, str]:
 
 
 def _get_seeds() -> list[str]:
+    db_seeds: list[str] = []
     with httpx.Client(timeout=20) as client:
         r = client.get(f"{SUPABASE_URL}/rest/v1/crawl_seeds", headers=_headers(), params={"select": "url", "enabled": "eq.true", "order": "id"})
         r.raise_for_status()
-        return [x["url"] for x in r.json() if x.get("url")]
+        db_seeds = [x["url"] for x in r.json() if x.get("url")]
+    return list(dict.fromkeys([*db_seeds, *DEFAULT_SEEDS]))
 
 
 def _queue_urls(urls: list[tuple[str, str | None, int]]) -> None:
@@ -71,7 +99,6 @@ def _queue_urls(urls: list[tuple[str, str | None, int]]) -> None:
 
 
 def _requeue_stale(limit: int = 50) -> None:
-    """Move old completed URLs back to pending so the index stays fresh."""
     cutoff = (datetime.now(timezone.utc) - timedelta(days=RECrawl_DAYS)).isoformat()
     with httpx.Client(timeout=20) as client:
         r = client.get(
@@ -195,10 +222,10 @@ def _extract(response: httpx.Response, url: str):
     language = (soup.html.get("lang", "").split("-")[0].lower() if soup.html and soup.html.get("lang") else _detect_language(content))
     if language not in {"en", "hi"}:
         language = _detect_language(content)
-    return {"page": {"url": url, "canonical_url": canonical or url, "domain": urlparse(url).netloc, "title": title[:1000], "description": description[:3000], "content": content[:1000000], "language": language, "status_code": response.status_code, "content_hash": hashlib.sha256(content.encode("utf-8", errors="ignore")).hexdigest(), "word_count": len(content.split())}, "soup": soup}
+    return {"page": {"url": url, "canonical_url": canonical or url, "domain": urlparse(url).netloc, "title": title[:1000], "description": description[:3000], "content": content[:MAX_CONTENT_CHARS], "language": language, "status_code": response.status_code, "content_hash": hashlib.sha256(content.encode("utf-8", errors="ignore")).hexdigest(), "word_count": len(content.split())}, "soup": soup}
 
 
-def crawl_seeds(max_pages: int = 10, max_depth: int = 2) -> int:
+def crawl_seeds(max_pages: int = 20, max_depth: int = 2) -> int:
     seeds = [normalize(x) for x in _get_seeds()]
     seeds = [x for x in seeds if x]
     if not seeds:
