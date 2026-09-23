@@ -1,12 +1,14 @@
-"""Search adapter with local index plus optional live Brave web search.
+"""Hybrid search for NisaanSearchEngine.
 
-Local results remain the project's own index. When BRAVE_SEARCH_API_KEY is
-configured, live web results are used to fill searches that the local index
-cannot satisfy. Live provider results are not persisted.
+The project stays free-first: search the project's own index first, then use
+Wikimedia's public search API as a no-key fallback when the local index has no
+match. Optional paid/provider integrations can be added later without making
+them required.
 """
 from __future__ import annotations
 
 import os
+import re
 from typing import Any
 
 import httpx
@@ -58,7 +60,9 @@ def _supabase_search(query: str, limit: int, offset: int) -> dict[str, Any]:
     if not SUPABASE_URL or not SUPABASE_KEY:
         raise RuntimeError("Supabase REST configuration is missing")
 
-    safe_query = query.replace("*", " ").strip()
+    safe_query = query.replace("*", " ").replace(",", " ").strip()
+    # Search the complete phrase first. This keeps the existing simple REST
+    # index inexpensive; the public-web fallback handles queries absent locally.
     or_filter = (
         f"(title.ilike.*{safe_query}*,"
         f"description.ilike.*{safe_query}*,"
@@ -94,28 +98,78 @@ def _local_search(query: str, limit: int, offset: int) -> dict[str, Any]:
     return _supabase_search(query, limit, offset)
 
 
-def _brave_search(query: str, limit: int, offset: int) -> dict[str, Any]:
-    """Search the live public web through Brave's independent web index.
+def _wiki_language(query: str) -> str:
+    # Use Hindi Wikipedia for Devanagari queries; English otherwise.
+    return "hi" if re.search(r"[\u0900-\u097F]", query) else "en"
 
-    Results are returned directly and deliberately not persisted. Brave's
-    current API terms restrict retaining API response data unless the account
-    has the appropriate storage rights.
-    """
+
+def _wikipedia_search(query: str, limit: int, offset: int) -> dict[str, Any]:
+    """Free no-key fallback using Wikimedia's public MediaWiki search API."""
+    language = _wiki_language(query)
+    # MediaWiki's search endpoint has a bounded page size; keep V1 cheap.
+    page_limit = min(max(limit, 1), 20)
+    params = {
+        "action": "query",
+        "list": "search",
+        "srsearch": query,
+        "srlimit": page_limit,
+        "sroffset": max(offset, 0),
+        "srprop": "snippet",
+        "format": "json",
+        "formatversion": "2",
+    }
+    headers = {
+        "User-Agent": "NisaanSearchEngine/1.0 (https://github.com/NissanL7/NisaanSearchEngine)"
+    }
+    with httpx.Client(timeout=15, follow_redirects=True) as client:
+        response = client.get(
+            f"https://{language}.wikipedia.org/w/api.php",
+            params=params,
+            headers=headers,
+        )
+        response.raise_for_status()
+        data = response.json()
+
+    query_data = data.get("query", {})
+    raw_results = query_data.get("search", [])
+    hits = []
+    for item in raw_results:
+        title = item.get("title") or "Wikipedia"
+        page_id = item.get("pageid")
+        url = f"https://{language}.wikipedia.org/wiki/{title.replace(' ', '_')}"
+        snippet = re.sub(r"<[^>]+>", "", item.get("snippet") or "").strip()
+        hits.append(
+            {
+                "id": f"wiki-{page_id or abs(hash(url))}",
+                "url": url,
+                "title": title,
+                "description": snippet,
+                "content": snippet,
+                "domain": f"{language}.wikipedia.org",
+                "language": language,
+                "source": "wikipedia",
+            }
+        )
+
+    return {
+        "estimatedTotalHits": int(query_data.get("searchinfo", {}).get("totalhits") or len(hits)),
+        "hits": hits,
+    }
+
+
+def _brave_search(query: str, limit: int, offset: int) -> dict[str, Any]:
+    """Optional live-web provider. Never required for the free setup."""
     if not BRAVE_API_KEY:
         return {"estimatedTotalHits": 0, "hits": []}
 
-    # Brave uses 1-based pagination. Keep this endpoint bounded for V1.
-    page = (offset // max(limit, 1)) + 1
+    page_size = min(max(limit, 1), 20)
     params = {
         "q": query,
-        "count": str(min(limit, 20)),
-        "offset": str(max(page - 1, 0) * min(limit, 20)),
+        "count": str(page_size),
+        "offset": str(max(offset, 0)),
         "safesearch": "moderate",
     }
-    headers = {
-        "Accept": "application/json",
-        "X-Subscription-Token": BRAVE_API_KEY,
-    }
+    headers = {"Accept": "application/json", "X-Subscription-Token": BRAVE_API_KEY}
     with httpx.Client(timeout=20) as client:
         response = client.get(
             "https://api.search.brave.com/res/v1/web/search",
@@ -126,9 +180,8 @@ def _brave_search(query: str, limit: int, offset: int) -> dict[str, Any]:
         data = response.json()
 
     web = data.get("web", {})
-    raw_results = web.get("results", [])
     hits = []
-    for index, item in enumerate(raw_results):
+    for index, item in enumerate(web.get("results", [])):
         url = item.get("url") or ""
         hits.append(
             {
@@ -148,13 +201,23 @@ def _brave_search(query: str, limit: int, offset: int) -> dict[str, Any]:
 
 
 def search(query: str, limit: int = 20, offset: int = 0) -> dict[str, Any]:
-    """Hybrid search: own index first, then live web coverage when enabled."""
+    """Search local index first, then free Wikimedia, then optional web provider."""
     local = _local_search(query, limit, offset)
     local_hits = local.get("hits", [])
-
-    # Keep our own index authoritative when it has matching pages. If it has
-    # no matches, use the live web index so ordinary queries don't look empty.
-    if local_hits or not BRAVE_API_KEY:
+    if local_hits:
         return local
 
-    return _brave_search(query, limit, offset)
+    try:
+        wiki = _wikipedia_search(query, limit, offset)
+        if wiki.get("hits"):
+            return wiki
+    except Exception:
+        pass
+
+    if BRAVE_API_KEY:
+        try:
+            return _brave_search(query, limit, offset)
+        except Exception:
+            pass
+
+    return local
