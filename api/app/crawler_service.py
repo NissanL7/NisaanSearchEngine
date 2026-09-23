@@ -1,4 +1,8 @@
-"""Small, controlled web crawler used by the API to grow the V1 index."""
+"""Controlled free-first crawler for NisaanSearchEngine.
+
+The crawler respects robots.txt, discovers same-domain links and sitemaps,
+and keeps strict page/depth limits so the free Render service is not abused.
+"""
 from __future__ import annotations
 
 import hashlib
@@ -50,16 +54,10 @@ def allowed_by_robots(url: str, cache: dict[str, RobotFileParser]) -> bool:
 def _supabase_headers() -> dict[str, str]:
     if not SUPABASE_URL or not SUPABASE_KEY:
         raise RuntimeError("Supabase REST configuration is missing")
-    return {
-        "apikey": SUPABASE_KEY,
-        "Authorization": f"Bearer {SUPABASE_KEY}",
-        "Content-Type": "application/json",
-    }
+    return {"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}", "Content-Type": "application/json"}
 
 
 def _get_seeds() -> list[str]:
-    if not SUPABASE_URL or not SUPABASE_KEY:
-        raise RuntimeError("Supabase REST configuration is missing")
     with httpx.Client(timeout=20) as client:
         response = client.get(
             f"{SUPABASE_URL}/rest/v1/crawl_seeds",
@@ -72,16 +70,11 @@ def _get_seeds() -> list[str]:
 
 
 def _save_page(page: dict) -> None:
-    # Prefer Supabase REST for the free V1 deployment. PostgreSQL remains a
-    # fallback for installations that already provide DATABASE_URL.
     if SUPABASE_URL and SUPABASE_KEY:
         with httpx.Client(timeout=20) as client:
             response = client.post(
                 f"{SUPABASE_URL}/rest/v1/pages",
-                headers={
-                    **_supabase_headers(),
-                    "Prefer": "resolution=merge-duplicates,return=minimal",
-                },
+                headers={**_supabase_headers(), "Prefer": "resolution=merge-duplicates,return=minimal"},
                 params={"on_conflict": "url"},
                 json=[page],
             )
@@ -90,7 +83,6 @@ def _save_page(page: dict) -> None:
 
     if DATABASE_URL:
         import psycopg
-
         with psycopg.connect(DATABASE_URL) as conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -104,11 +96,64 @@ def _save_page(page: dict) -> None:
                 )
             conn.commit()
         return
-
     raise RuntimeError("No database or Supabase REST configuration is available")
 
 
-def crawl_seeds(max_pages: int = 10, max_depth: int = 1) -> int:
+def _discover_sitemap_urls(seed: str, client: httpx.Client, limit: int = 40) -> list[str]:
+    """Read a site's sitemap and return URLs on the same host.
+
+    We only inspect standard sitemap locations and never follow sitemap links
+    to unrelated hosts. Sitemap discovery gives V1 much better coverage than
+    relying only on links visible on a homepage.
+    """
+    p = urlparse(seed)
+    origin = f"{p.scheme}://{p.netloc}"
+    candidates = [f"{origin}/sitemap.xml", f"{origin}/sitemap_index.xml"]
+    urls: list[str] = []
+    for sitemap in candidates:
+        try:
+            response = client.get(sitemap, headers={"Accept": "application/xml,text/xml"})
+            if not response.is_success:
+                continue
+            text = response.text[:2_000_000]
+            # Works for normal sitemaps and simple sitemap indexes.
+            for match in re.findall(r"<loc>\s*(.*?)\s*</loc>", text, flags=re.I | re.S):
+                candidate = normalize(match)
+                if candidate and urlparse(candidate).netloc == p.netloc:
+                    urls.append(candidate)
+                    if len(urls) >= limit:
+                        return list(dict.fromkeys(urls))[:limit]
+        except httpx.HTTPError:
+            continue
+    return list(dict.fromkeys(urls))[:limit]
+
+
+def _extract_page(response: httpx.Response, url: str) -> tuple[dict, BeautifulSoup] | None:
+    if "text/html" not in response.headers.get("content-type", "").lower():
+        return None
+    soup = BeautifulSoup(response.content[:MAX_BYTES], "lxml")
+    for tag in soup(["script", "style", "noscript", "svg", "template"]):
+        tag.decompose()
+    title = soup.title.get_text(" ", strip=True) if soup.title else ""
+    meta = soup.find("meta", attrs={"name": re.compile("^description$", re.I)})
+    description = meta.get("content", "").strip() if meta else ""
+    content = re.sub(r"\s+", " ", " ".join(soup.stripped_strings)).strip()
+    digest = hashlib.sha256(content.encode("utf-8", errors="ignore")).hexdigest()
+    page = {
+        "url": url,
+        "canonical_url": url,
+        "domain": urlparse(url).netloc,
+        "title": title[:1000],
+        "description": description[:3000],
+        "content": content[:1000000],
+        "status_code": response.status_code,
+        "content_hash": digest,
+        "word_count": len(content.split()),
+    }
+    return page, soup
+
+
+def crawl_seeds(max_pages: int = 10, max_depth: int = 2) -> int:
     seeds = [u for u in (normalize(s) for s in _get_seeds()) if u]
     if not seeds:
         return 0
@@ -120,6 +165,13 @@ def crawl_seeds(max_pages: int = 10, max_depth: int = 1) -> int:
     headers = {"User-Agent": USER_AGENT, "Accept": "text/html,application/xhtml+xml"}
 
     with httpx.Client(headers=headers, follow_redirects=True, timeout=12) as client:
+        # Add sitemap URLs before normal link crawling. They remain same-domain.
+        for seed in seeds:
+            for sitemap_url in _discover_sitemap_urls(seed, client, limit=20):
+                if sitemap_url not in seen:
+                    seen.add(sitemap_url)
+                    queue.append((sitemap_url, 1))
+
         while queue and saved < max_pages:
             url, depth = queue.popleft()
             if not allowed_by_robots(url, robots):
@@ -128,29 +180,10 @@ def crawl_seeds(max_pages: int = 10, max_depth: int = 1) -> int:
                 response = client.get(url)
             except httpx.HTTPError:
                 continue
-            if "text/html" not in response.headers.get("content-type", "").lower():
+            extracted = _extract_page(response, url)
+            if not extracted:
                 continue
-
-            soup = BeautifulSoup(response.content[:MAX_BYTES], "lxml")
-            for tag in soup(["script", "style", "noscript", "svg", "template"]):
-                tag.decompose()
-            title = soup.title.get_text(" ", strip=True) if soup.title else ""
-            meta = soup.find("meta", attrs={"name": re.compile("^description$", re.I)})
-            description = meta.get("content", "").strip() if meta else ""
-            content = re.sub(r"\s+", " ", " ".join(soup.stripped_strings)).strip()
-            digest = hashlib.sha256(content.encode("utf-8", errors="ignore")).hexdigest()
-
-            page = {
-                "url": url,
-                "canonical_url": url,
-                "domain": urlparse(url).netloc,
-                "title": title[:1000],
-                "description": description[:3000],
-                "content": content[:1000000],
-                "status_code": response.status_code,
-                "content_hash": digest,
-                "word_count": len(content.split()),
-            }
+            page, soup = extracted
             _save_page(page)
             saved += 1
 
