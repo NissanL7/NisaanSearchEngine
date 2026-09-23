@@ -46,8 +46,6 @@ def _postgres_search(query: str, limit: int, offset: int) -> dict[str, Any]:
 
     with psycopg.connect(DATABASE_URL) as conn:
         with conn.cursor() as cur:
-            # Primary path: PostgreSQL full-text search. This can use the
-            # pages_search_english_idx GIN index created in Supabase.
             cur.execute(
                 f"""
                 select {fields},
@@ -97,8 +95,6 @@ def _postgres_search(query: str, limit: int, offset: int) -> dict[str, Any]:
             if hits:
                 return {"estimatedTotalHits": total, "hits": hits}
 
-            # Fallback keeps short/exact queries useful when PostgreSQL's
-            # English stemming/tokenization produces no full-text match.
             tokens = _tokens(query)
             terms = list(dict.fromkeys([query, *tokens]))[:12]
             clauses, params = [], {}
@@ -274,19 +270,25 @@ def search(query: str, limit: int = 20, offset: int = 0) -> dict[str, Any]:
     query = query.strip()
     if not query:
         return {"estimatedTotalHits": 0, "hits": []}
+
+    # Always query the local index AND the live web provider. Previously the
+    # web provider was skipped whenever the local index already had enough
+    # results, which made the engine appear to search only its own crawl data.
     candidate_limit = min(max(limit + offset, 30), 100)
     local = _local_search(query, candidate_limit, 0)
     local_hits = local.get("hits", [])
     for hit in local_hits:
         hit.setdefault("source", "local")
-    merged = list(local_hits)
+
     web = {"estimatedTotalHits": 0, "hits": []}
-    if BRAVE_API_KEY and len(merged) < candidate_limit:
+    if BRAVE_API_KEY:
         try:
             web = _brave_search(query, candidate_limit, 0)
-            merged = _merge_hits(merged, web.get("hits", []), candidate_limit)
         except Exception:
+            # Local search must remain available if the live provider is down.
             pass
+
+    merged = _merge_hits(local_hits, web.get("hits", []), candidate_limit)
     ranked = _rank_hits(merged, query)
     page = ranked[offset : offset + limit]
     total = max(
