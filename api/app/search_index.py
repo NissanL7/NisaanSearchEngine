@@ -1,13 +1,15 @@
-"""Search NisaanSearchEngine's own index with free-first ranking."""
+"""Search NisaanSearchEngine's own index plus broad live-web providers."""
 from __future__ import annotations
 
 import os
 import re
 from difflib import SequenceMatcher
 from typing import Any
+from urllib.parse import parse_qs, unquote, urlparse
 
 import httpx
 import psycopg
+from bs4 import BeautifulSoup
 
 MEILI_URL = os.getenv("MEILISEARCH_URL", "").rstrip("/")
 MEILI_KEY = os.getenv("MEILISEARCH_MASTER_KEY", "")
@@ -37,11 +39,7 @@ def _meili_search(query: str, limit: int, offset: int) -> dict[str, Any]:
 
 
 def _postgres_search(query: str, limit: int, offset: int) -> dict[str, Any]:
-    """Search PostgreSQL using the GIN full-text index, with an ILIKE fallback.
-
-    The full-text expression matches the expression used by the Supabase
-    migration: title + description + content, using the English dictionary.
-    """
+    """Search PostgreSQL using the GIN full-text index, with an ILIKE fallback."""
     fields = "id,url,title,description,content,domain,language,status_code,crawled_at,word_count"
 
     with psycopg.connect(DATABASE_URL) as conn:
@@ -68,24 +66,17 @@ def _postgres_search(query: str, limit: int, offset: int) -> dict[str, Any]:
                 order by text_rank desc, crawled_at desc nulls last
                 limit %(candidate_limit)s offset %(offset)s
                 """,
-                {
-                    "query": query,
-                    "candidate_limit": min(max(limit + offset, 30), 100),
-                    "offset": offset,
-                },
+                {"query": query, "candidate_limit": min(max(limit + offset, 30), 100), "offset": offset},
             )
             columns = [d.name for d in cur.description]
             hits = [dict(zip(columns, row)) for row in cur.fetchall()]
 
             cur.execute(
                 """
-                select count(*)
-                from pages
+                select count(*) from pages
                 where to_tsvector(
                     'english',
-                    coalesce(title, '') || ' ' ||
-                    coalesce(description, '') || ' ' ||
-                    coalesce(content, '')
+                    coalesce(title, '') || ' ' || coalesce(description, '') || ' ' || coalesce(content, '')
                 ) @@ websearch_to_tsquery('english', %(query)s)
                 """,
                 {"query": query},
@@ -110,9 +101,7 @@ def _postgres_search(query: str, limit: int, offset: int) -> dict[str, Any]:
             fallback_total = int(cur.fetchone()[0] or 0)
             cur.execute(
                 f"""
-                select {fields}
-                from pages
-                where {where}
+                select {fields} from pages where {where}
                 order by crawled_at desc nulls last
                 limit %(limit)s offset %(offset)s
                 """,
@@ -192,16 +181,91 @@ def _brave_search(query: str, limit: int, offset: int) -> dict[str, Any]:
         url = item.get("url") or ""
         hits.append(
             {
-                "id": f"web-{offset+i}-{abs(hash(url))}",
+                "id": f"brave-{offset+i}-{abs(hash(url))}",
                 "url": url,
                 "title": item.get("title") or url,
                 "description": item.get("description") or "",
                 "content": item.get("description") or "",
-                "domain": item.get("profile", {}).get("long_name") or "",
-                "source": "web-provider",
+                "domain": item.get("profile", {}).get("long_name") or urlparse(url).netloc,
+                "source": "brave",
             }
         )
     return {"estimatedTotalHits": int(web.get("totalEstimatedMatches") or len(hits)), "hits": hits}
+
+
+def _unwrap_ddg_url(href: str) -> str:
+    if not href:
+        return ""
+    parsed = urlparse(href)
+    if parsed.path.startswith("/l/"):
+        target = parse_qs(parsed.query).get("uddg", [""])[0]
+        return unquote(target) or href
+    return href
+
+
+def _duckduckgo_search(query: str, limit: int, offset: int) -> dict[str, Any]:
+    """No-key broad-web fallback using DuckDuckGo's HTML results page.
+
+    This is only a fallback: Brave is preferred when BRAVE_SEARCH_API_KEY is
+    configured. The HTML endpoint is useful for the free deployment because it
+    does not require another paid API credential.
+    """
+    with httpx.Client(
+        timeout=20,
+        follow_redirects=True,
+        headers={
+            "User-Agent": "Mozilla/5.0 (compatible; NisaanSearchEngine/1.0; +https://github.com/NissanL7/NisaanSearchEngine)",
+            "Accept-Language": "en-US,en;q=0.9",
+        },
+    ) as client:
+        r = client.get(
+            "https://html.duckduckgo.com/html/",
+            params={"q": query},
+        )
+        r.raise_for_status()
+
+    soup = BeautifulSoup(r.text, "lxml")
+    hits: list[dict[str, Any]] = []
+    for i, result in enumerate(soup.select(".result")):
+        link = result.select_one("a.result__a")
+        if not link:
+            continue
+        url = _unwrap_ddg_url(link.get("href", ""))
+        if not url.startswith(("http://", "https://")):
+            continue
+        title = link.get_text(" ", strip=True)
+        snippet_node = result.select_one(".result__snippet")
+        description = snippet_node.get_text(" ", strip=True) if snippet_node else ""
+        hits.append(
+            {
+                "id": f"ddg-{offset+i}-{abs(hash(url))}",
+                "url": url,
+                "title": title or url,
+                "description": description,
+                "content": description,
+                "domain": urlparse(url).netloc,
+                "source": "duckduckgo",
+            }
+        )
+        if len(hits) >= min(max(limit + offset, 10), 20):
+            break
+
+    return {"estimatedTotalHits": len(hits), "hits": hits}
+
+
+def _web_search(query: str, limit: int, offset: int) -> dict[str, Any]:
+    """Search the live web, using Brave first and DDG as a no-key fallback."""
+    if BRAVE_API_KEY:
+        try:
+            brave = _brave_search(query, limit, offset)
+            if brave.get("hits"):
+                return brave
+        except Exception:
+            pass
+    try:
+        return _duckduckgo_search(query, limit, offset)
+    except Exception:
+        return {"estimatedTotalHits": 0, "hits": []}
 
 
 def _score_hit(hit: dict[str, Any], query: str) -> float:
@@ -236,7 +300,7 @@ def _score_hit(hit: dict[str, Any], query: str) -> float:
             score += min(12, 2 + content.count(token) * 1.5)
     if q_tokens:
         score += 25 * sum(token in haystack for token in q_tokens) / len(q_tokens)
-    if hit.get("source", "local") == "local":
+    if hit.get("source") == "local":
         score += 6
     if title and q:
         ratio = SequenceMatcher(None, q, title).ratio()
@@ -271,22 +335,15 @@ def search(query: str, limit: int = 20, offset: int = 0) -> dict[str, Any]:
     if not query:
         return {"estimatedTotalHits": 0, "hits": []}
 
-    # Always query the local index AND the live web provider. Previously the
-    # web provider was skipped whenever the local index already had enough
-    # results, which made the engine appear to search only its own crawl data.
     candidate_limit = min(max(limit + offset, 30), 100)
     local = _local_search(query, candidate_limit, 0)
     local_hits = local.get("hits", [])
     for hit in local_hits:
         hit.setdefault("source", "local")
 
-    web = {"estimatedTotalHits": 0, "hits": []}
-    if BRAVE_API_KEY:
-        try:
-            web = _brave_search(query, candidate_limit, 0)
-        except Exception:
-            # Local search must remain available if the live provider is down.
-            pass
+    # Always query the live web. This is what makes the engine useful for
+    # queries that are not already present in our own crawl/index.
+    web = _web_search(query, candidate_limit, 0)
 
     merged = _merge_hits(local_hits, web.get("hits", []), candidate_limit)
     ranked = _rank_hits(merged, query)
