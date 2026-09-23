@@ -1,13 +1,14 @@
 """Free-first hybrid search for NisaanSearchEngine.
 
 The local index is always preferred, but V1 also merges public Wikimedia
-results when available. This means a query can return useful results even
-when NisaanSearchEngine has not crawled that topic yet.
+results when available. Results are scored locally so title/domain matches,
+phrase matches, and term coverage rank above weak substring matches.
 """
 from __future__ import annotations
 
 import os
 import re
+from difflib import SequenceMatcher
 from typing import Any
 
 import httpx
@@ -59,7 +60,6 @@ def _supabase_search(query: str, limit: int, offset: int) -> dict[str, Any]:
     if not SUPABASE_URL or not SUPABASE_KEY:
         raise RuntimeError("Supabase REST configuration is missing")
     safe_query = query.replace("*", " ").replace(",", " ").strip()
-    # Escape characters that could change PostgREST filter syntax.
     safe_query = safe_query.replace("%", " ").replace("(", " ").replace(")", " ")
     or_filter = (
         f"(title.ilike.*{safe_query}*,"
@@ -169,8 +169,71 @@ def _brave_search(query: str, limit: int, offset: int) -> dict[str, Any]:
     return {"estimatedTotalHits": int(web.get("totalEstimatedMatches") or len(hits)), "hits": hits}
 
 
+def _tokens(text: str) -> list[str]:
+    return re.findall(r"[\w\u0900-\u097F]+", text.lower(), flags=re.UNICODE)
+
+
+def _score_hit(hit: dict[str, Any], query: str) -> float:
+    """Lightweight BM25-like relevance score without adding paid dependencies."""
+    q = query.lower().strip()
+    q_tokens = list(dict.fromkeys(_tokens(q)))
+    title = str(hit.get("title") or "").lower()
+    description = str(hit.get("description") or "").lower()
+    content = str(hit.get("content") or "").lower()
+    domain = str(hit.get("domain") or "").lower()
+    haystack = f"{title} {description} {content}"
+
+    score = 0.0
+    if q and q in title:
+        score += 60.0
+    if q and q in domain:
+        score += 35.0
+    if q and q in description:
+        score += 20.0
+    if q and q in content:
+        score += 8.0
+
+    for token in q_tokens:
+        if token in _tokens(title):
+            score += 28.0
+        if token in _tokens(domain):
+            score += 14.0
+        if token in _tokens(description):
+            score += 8.0
+        if token in _tokens(content):
+            score += min(12.0, 2.0 + content.count(token) * 1.5)
+
+    coverage = sum(1 for token in q_tokens if token in haystack)
+    if q_tokens:
+        score += 25.0 * coverage / len(q_tokens)
+
+    # Give independently crawled pages a small source-quality advantage over fallback snippets.
+    source = str(hit.get("source") or "local")
+    if source == "local":
+        score += 6.0
+
+    # A small fuzzy bonus helps with minor misspellings without inventing results.
+    if q and title:
+        ratio = SequenceMatcher(None, q, title).ratio()
+        if ratio >= 0.55:
+            score += ratio * 8.0
+    return score
+
+
+def _rank_hits(hits: list[dict[str, Any]], query: str) -> list[dict[str, Any]]:
+    ranked = []
+    for hit in hits:
+        item = dict(hit)
+        item["_score"] = round(_score_hit(item, query), 3)
+        ranked.append(item)
+    ranked.sort(key=lambda item: item.get("_score", 0), reverse=True)
+    for item in ranked:
+        item.pop("_score", None)
+    return ranked
+
+
 def _merge_hits(primary: list[dict[str, Any]], secondary: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
-    """Merge local and public results while deduplicating URLs."""
+    """Merge results and deduplicate by normalized URL."""
     merged: list[dict[str, Any]] = []
     seen_urls: set[str] = set()
     for hit in [*primary, *secondary]:
@@ -185,36 +248,40 @@ def _merge_hits(primary: list[dict[str, Any]], secondary: list[dict[str, Any]], 
 
 
 def search(query: str, limit: int = 20, offset: int = 0) -> dict[str, Any]:
-    """Search local pages, then fill missing slots with free Wikimedia results.
-
-    If a live provider key is configured, it is used only when both local and
-    Wikimedia results are insufficient. No paid service is required for V1.
-    """
+    """Search local pages, Wikipedia, and optionally a configured web provider."""
     query = query.strip()
-    local = _local_search(query, limit, offset)
+    if not query:
+        return {"estimatedTotalHits": 0, "hits": []}
+
+    # Fetch enough candidates to rank before applying pagination.
+    candidate_limit = min(max(limit + offset, 20), 100)
+    local = _local_search(query, candidate_limit, 0)
     local_hits = local.get("hits", [])
 
-    # Keep local results first, but don't stop just because one local page matched.
-    wiki_hits: list[dict[str, Any]] = []
     try:
-        wiki = _wikipedia_search(query, limit, 0)
+        wiki = _wikipedia_search(query, candidate_limit, 0)
         wiki_hits = wiki.get("hits", [])
     except Exception:
         wiki = {"estimatedTotalHits": 0, "hits": []}
+        wiki_hits = []
 
-    merged = _merge_hits(local_hits, wiki_hits, limit)
-    if len(merged) >= limit:
-        return {"estimatedTotalHits": max(local.get("estimatedTotalHits", 0), len(merged)), "hits": merged[offset:offset + limit]}
+    merged = _merge_hits(local_hits, wiki_hits, candidate_limit)
 
-    if BRAVE_API_KEY:
+    if len(merged) < candidate_limit and BRAVE_API_KEY:
         try:
-            web = _brave_search(query, limit, 0)
-            merged = _merge_hits(merged, web.get("hits", []), limit)
-            if merged:
-                return {"estimatedTotalHits": max(local.get("estimatedTotalHits", 0), web.get("estimatedTotalHits", 0), len(merged)), "hits": merged[offset:offset + limit]}
+            web = _brave_search(query, candidate_limit, 0)
+            merged = _merge_hits(merged, web.get("hits", []), candidate_limit)
         except Exception:
-            pass
+            web = {"estimatedTotalHits": 0, "hits": []}
+    else:
+        web = {"estimatedTotalHits": 0, "hits": []}
 
-    if merged:
-        return {"estimatedTotalHits": max(local.get("estimatedTotalHits", 0), wiki.get("estimatedTotalHits", 0), len(merged)), "hits": merged[offset:offset + limit]}
-    return local
+    ranked = _rank_hits(merged, query)
+    page = ranked[offset:offset + limit]
+    total = max(
+        int(local.get("estimatedTotalHits", 0) or 0),
+        int(wiki.get("estimatedTotalHits", 0) or 0),
+        int(web.get("estimatedTotalHits", 0) or 0),
+        len(ranked),
+    )
+    return {"estimatedTotalHits": total, "hits": page}
