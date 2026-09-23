@@ -10,19 +10,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from .crawler_service import crawl_seeds
 from .search_index import search
 
-origins = [
-    origin.strip()
-    for origin in os.getenv("API_CORS_ORIGINS", "http://localhost:3000").split(",")
-    if origin.strip()
-]
+origins = [origin.strip() for origin in os.getenv("API_CORS_ORIGINS", "http://localhost:3000").split(",") if origin.strip()]
 
-app = FastAPI(title="NisaanSearchEngine API", version="0.1.0")
+app = FastAPI(title="NisaanSearchEngine API", version="0.2.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
     allow_credentials=False,
     allow_methods=["GET"],
-    allow_headers=["*"]
+    allow_headers=["*"],
 )
 
 _last_crawl = 0.0
@@ -30,7 +26,7 @@ _last_crawl = 0.0
 
 @app.get("/health")
 def health() -> dict[str, str]:
-    return {"status": "ok", "service": "NisaanSearchEngine API"}
+    return {"status": "ok", "service": "NisaanSearchEngine API", "version": "0.2.0"}
 
 
 @app.get("/search")
@@ -53,15 +49,18 @@ def search_endpoint(
 
 
 @app.get("/crawl")
-def crawl_endpoint(max_pages: int = Query(default=10, ge=1, le=10)):
-    """Crawl only the configured public seed domains and add pages to the index."""
+def crawl_endpoint(
+    max_pages: int = Query(default=10, ge=1, le=10),
+    max_depth: int = Query(default=2, ge=0, le=2),
+):
+    """Crawl configured public seed domains, including sitemap URLs and same-domain links."""
     global _last_crawl
     now = time.time()
     if now - _last_crawl < 60:
         raise HTTPException(status_code=429, detail="Crawler cooldown: try again in under a minute")
     _last_crawl = now
     try:
-        saved = crawl_seeds(max_pages=max_pages, max_depth=1)
-        return {"ok": True, "pages_indexed": saved, "max_pages": max_pages}
+        saved = crawl_seeds(max_pages=max_pages, max_depth=max_depth)
+        return {"ok": True, "pages_indexed": saved, "max_pages": max_pages, "max_depth": max_depth}
     except Exception as exc:
         raise HTTPException(status_code=503, detail="Crawler unavailable") from exc
